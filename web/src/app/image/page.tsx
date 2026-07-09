@@ -1964,7 +1964,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           </DialogContent>
         </Dialog>
 
-        <div className={cn("min-h-0 flex-col gap-2 sm:gap-4 xl:flex", mobilePanel === "image" ? "flex" : "hidden")}>
+        <div className={cn("h-full min-h-0 flex-col gap-2 overflow-hidden sm:gap-4 xl:flex", mobilePanel === "image" ? "flex" : "hidden")}>
           <div className="flex items-center justify-between gap-2 px-1 lg:hidden">
             <Button
               variant="outline"
@@ -1995,7 +1995,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             <div
               ref={resultsViewportRef}
               onScroll={handleResultsScroll}
-              className="hide-scrollbar h-full overscroll-contain overflow-y-auto px-1 py-2 sm:px-4 sm:py-4"
+              className="hide-scrollbar h-full overscroll-contain overflow-y-auto px-1 pb-28 pt-2 sm:px-4 sm:pb-32 sm:pt-4"
               style={{ contain: "layout style paint" }}
             >
               <ImageResults

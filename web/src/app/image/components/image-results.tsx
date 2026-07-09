@@ -260,7 +260,7 @@ export function ImageResults({
 
                         return (
                           <div key={image.id} className="overflow-hidden rounded-xl border border-stone-200/80 bg-white shadow-[0_16px_50px_-42px_rgba(15,23,42,0.35)] dark:border-white/10 dark:bg-stone-900/70">
-                            <div className="group relative bg-stone-100/70">
+                            <div className="bg-stone-100/70">
                               <LazyImage
                                 src={imageSrc}
                                 alt={`Generated result ${index + 1}`}
@@ -274,44 +274,44 @@ export function ImageResults({
                                 }}
                                 onOpen={() => onOpenLightbox(successfulTurnImages, currentIndex)}
                               />
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="absolute left-2 top-2 h-8 rounded-xl border-white/80 bg-white/90 px-2 text-xs text-stone-700 shadow-sm backdrop-blur hover:bg-white"
-                                onClick={() => void onAddImageToMaterials(image, index)}
-                                aria-label="加入素材库"
-                                title="加入素材库"
-                              >
-                                <FolderPlus className="size-3.5" />
-                              </Button>
-                              <div className="absolute right-2 top-2 flex gap-1.5 opacity-100 transition sm:opacity-0 sm:group-hover:opacity-100">
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-8 rounded-xl border-white/80 bg-white/90 px-2 text-xs text-stone-700 shadow-sm backdrop-blur hover:bg-white"
-                                  onClick={() => onContinueEdit(selectedConversation.id, image)}
-                                  aria-label="加入编辑"
-                                >
-                                  <Sparkles className="size-3.5" />
-                                  <span className="hidden 2xl:inline">加入编辑</span>
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-8 rounded-xl border-white/80 bg-white/90 px-2 text-xs text-stone-700 shadow-sm backdrop-blur hover:bg-white"
-                                  onClick={() => void downloadStoredImage(image, index)}
-                                  aria-label="下载"
-                                >
-                                  <Download className="size-3.5" />
-                                  <span className="hidden 2xl:inline">下载</span>
-                                </Button>
-                              </div>
                             </div>
-                            <div className="flex min-h-14 items-start justify-between gap-3 px-3 py-3 text-xs">
-                              <div className="min-w-0 leading-5 text-stone-500">
+                            <div className="flex min-h-[4.25rem] items-center justify-between gap-3 px-3 py-3 text-xs">
+                              <div className="min-w-0 flex-1 leading-5 text-stone-500">
                                 <span>结果 {index + 1}</span>
                                 {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
                                 {imageMeta ? <span className="block text-stone-400">{imageMeta}</span> : null}
+                              </div>
+                              <div className="flex shrink-0 items-center gap-1">
+                                <Button
+                                  variant="outline"
+                                  size="icon"
+                                  className="size-8 rounded-xl border-stone-200 bg-white text-stone-600 shadow-none hover:bg-stone-50 hover:text-stone-900 dark:border-white/10 dark:bg-stone-900"
+                                  onClick={() => void onAddImageToMaterials(image, index)}
+                                  aria-label="加入素材库"
+                                  title="加入素材库"
+                                >
+                                  <FolderPlus className="size-3.5" />
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="icon"
+                                  className="size-8 rounded-xl border-stone-200 bg-white text-stone-600 shadow-none hover:bg-stone-50 hover:text-stone-900 dark:border-white/10 dark:bg-stone-900"
+                                  onClick={() => onContinueEdit(selectedConversation.id, image)}
+                                  aria-label="加入编辑"
+                                  title="加入编辑"
+                                >
+                                  <Sparkles className="size-3.5" />
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="icon"
+                                  className="size-8 rounded-xl border-stone-200 bg-white text-stone-600 shadow-none hover:bg-stone-50 hover:text-stone-900 dark:border-white/10 dark:bg-stone-900"
+                                  onClick={() => void downloadStoredImage(image, index)}
+                                  aria-label="下载"
+                                  title="下载"
+                                >
+                                  <Download className="size-3.5" />
+                                </Button>
                               </div>
                             </div>
                           </div>
