@@ -335,13 +335,21 @@ export function ImageResults({
                             >
                             <div className="flex h-full min-h-16 flex-col items-center justify-center gap-1.5 px-3 py-3 text-center text-[11px] leading-4 text-stone-500 sm:gap-3 sm:px-6 sm:py-8 sm:text-sm sm:leading-6">
                               <p className="font-medium text-rose-600">图片 {index + 1}/{turn.images.length}</p>
-                              <span className="line-clamp-2 sm:line-clamp-none">{image.error || "生成失败"}</span>
-                              <div className="flex items-center gap-2">
+                              <span className="line-clamp-4">{image.error || "生成失败"}</span>
+                            </div>
+                            </div>
+                            <div className="flex min-h-[5rem] flex-col gap-2 px-3 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+                              <div className="min-w-0 leading-5 text-stone-500">
+                                <span>结果 {index + 1}</span>
+                                {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
+                                <span className="block text-transparent">-</span>
+                              </div>
+                              <div className="flex w-full flex-wrap items-center gap-1.5 sm:w-auto sm:justify-end">
                                 {isTimeoutError && (
                                   <button
                                     type="button"
                                     onClick={() => void onTimeoutRetryContinue(selectedConversation.id, turn.id, image.taskId!)}
-                                    className="rounded-xl bg-emerald-100 px-2 py-1 text-[10px] font-medium text-emerald-600 shadow-sm transition hover:bg-emerald-200 sm:px-3 sm:text-xs"
+                                    className="inline-flex h-8 shrink-0 items-center rounded-xl bg-emerald-100 px-3 text-[11px] font-medium text-emerald-700 shadow-sm transition hover:bg-emerald-200 sm:text-xs"
                                   >
                                     继续等待
                                   </button>
@@ -349,18 +357,11 @@ export function ImageResults({
                                 <button
                                   type="button"
                                   onClick={() => void onRetryImage(selectedConversation.id, turn.id, image.id)}
-                                  className="rounded-xl bg-white px-2 py-1 text-[10px] font-medium text-rose-600 shadow-sm transition hover:bg-rose-100 sm:px-3 sm:text-xs"
+                                  className="inline-flex h-8 shrink-0 items-center rounded-xl bg-rose-50 px-3 text-[11px] font-medium text-rose-600 shadow-sm transition hover:bg-rose-100 sm:text-xs"
+                                  title="重新生成这一张"
                                 >
-                                  重新生成这一张
+                                  重新生成
                                 </button>
-                              </div>
-                            </div>
-                            </div>
-                            <div className="flex min-h-14 items-start px-3 py-3 text-xs">
-                              <div className="min-w-0 leading-5 text-stone-500">
-                                <span>结果 {index + 1}</span>
-                                {image.durationMs != null ? <span className="text-stone-400 sm:ml-2">{formatDuration(image.durationMs)}</span> : null}
-                                <span className="block text-transparent">-</span>
                               </div>
                             </div>
                           </div>
