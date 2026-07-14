@@ -249,7 +249,8 @@ class ImageTaskService:
             task = {
                 "id": task_id,
                 "owner_id": owner,
-                "status": TASK_STATUS_QUEUED,
+                # Every task gets its own worker immediately; there is no shared FIFO queue.
+                "status": TASK_STATUS_RUNNING,
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
@@ -269,7 +270,15 @@ class ImageTaskService:
                 name=f"image-task-{task_id[:16]}",
                 daemon=True,
             )
-            thread.start()
+            try:
+                thread.start()
+            except Exception as exc:
+                self._update_task(
+                    key,
+                    status=TASK_STATUS_ERROR,
+                    error=str(exc) or "image task worker failed to start",
+                )
+                raise
         return _public_task(task)
 
     @staticmethod

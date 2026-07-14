@@ -71,7 +71,7 @@
     }
   },
   "image_account_concurrency": 3,
-  "image_redundant_generation_enabled": true,
+  "image_redundant_generation_enabled": false,
   "image_redundant_copies": 2,
   "image_redundant_max_attempts": 3,
   "image_parallel_generation": true,

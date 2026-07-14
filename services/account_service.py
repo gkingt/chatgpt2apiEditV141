@@ -54,6 +54,7 @@ class AccountService:
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        self._image_last_submitted_at: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -395,6 +396,45 @@ class AccountService:
         finally:
             session.close()
 
+    def _request_chatgpt_session_refresh(self, account: dict) -> dict[str, str]:
+        from curl_cffi import requests
+        from services.proxy_service import proxy_settings
+
+        cookie_header = str(account.get("cookie") or "").strip()
+        if not cookie_header:
+            raise RuntimeError("chatgpt_session_cookie_missing")
+        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
+        try:
+            response = session.get(
+                "https://chatgpt.com/api/auth/session",
+                headers={
+                    "Accept": "application/json",
+                    "Cookie": cookie_header,
+                    "Referer": "https://chatgpt.com/",
+                    "User-Agent": self._OAUTH_USER_AGENT,
+                },
+                timeout=30,
+            )
+            data = response.json() if response.text else {}
+            access_token = str(data.get("accessToken") or data.get("access_token") or "").strip() if isinstance(data, dict) else ""
+            if response.status_code != 200 or not access_token:
+                detail = self._safe_response_text(response)
+                raise RuntimeError(f"chatgpt_session_http_{response.status_code}{': ' + detail if detail else ''}")
+
+            cookie_values: dict[str, str] = {}
+            for part in cookie_header.split(";"):
+                name, separator, value = part.strip().partition("=")
+                if separator and name:
+                    cookie_values[name] = value
+            cookie_values.update({str(key): str(value) for key, value in session.cookies.get_dict().items() if key and value})
+            return {
+                "access_token": access_token,
+                "session_token": str(data.get("sessionToken") or data.get("session_token") or "").strip(),
+                "cookie": "; ".join(f"{key}={value}" for key, value in cookie_values.items()),
+            }
+        finally:
+            session.close()
+
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
@@ -412,6 +452,10 @@ class AccountService:
                 next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
             if token_data.get("id_token"):
                 next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            if token_data.get("session_token"):
+                next_item["session_token"] = str(token_data.get("session_token") or "").strip()
+            if token_data.get("cookie"):
+                next_item["cookie"] = str(token_data.get("cookie") or "").strip()
             next_item["last_token_refresh_at"] = now
             next_item["last_token_refresh_error"] = None
             next_item["last_token_refresh_error_at"] = None
@@ -431,6 +475,9 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                submitted_at = self._image_last_submitted_at.pop(old_token, 0.0)
+                if submitted_at:
+                    self._image_last_submitted_at[new_token] = submitted_at
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
@@ -442,6 +489,34 @@ class AccountService:
         )
         return new_token
 
+    def _apply_platform_refreshed_tokens(self, access_token: str, token_data: dict, event: str) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._image_slot_condition:
+            active_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(active_token)
+            if current is None:
+                return active_token
+            next_item = dict(current)
+            next_item["platform_access_token"] = str(token_data.get("access_token") or "").strip()
+            if token_data.get("refresh_token"):
+                next_item["refresh_token"] = str(token_data.get("refresh_token") or "").strip()
+            if token_data.get("id_token"):
+                next_item["id_token"] = str(token_data.get("id_token") or "").strip()
+            next_item["last_token_refresh_at"] = now
+            next_item["last_token_refresh_error"] = None
+            next_item["last_token_refresh_error_at"] = None
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[active_token] = account
+                self._save_accounts()
+                self._image_slot_condition.notify_all()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "refresh_token 已刷新 platform access_token",
+            {"source": event, "token": anonymize_token(active_token)},
+        )
+        return active_token
+
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
@@ -452,8 +527,22 @@ class AccountService:
             active_token = str(account.get("access_token") or resolved_token or access_token)
             if not self._token_needs_refresh(active_token, force=force):
                 return active_token
+            session_refreshed = False
+            session_error = ""
+            if str(account.get("cookie") or "").strip():
+                try:
+                    session_data = self._request_chatgpt_session_refresh(account)
+                    active_token = self._apply_refreshed_tokens(active_token, session_data, f"{event}:chatgpt_session")
+                    account = self.get_account(active_token) or account
+                    session_refreshed = True
+                    if not force:
+                        return active_token
+                except Exception as exc:
+                    session_error = str(exc or "chatgpt session refresh failed")
             refresh_token = str(account.get("refresh_token") or "").strip()
             if not refresh_token:
+                if session_error:
+                    self._record_token_refresh_error(active_token, event, session_error)
                 return active_token
             if not force and self._recent_token_refresh_error(account):
                 return active_token
@@ -476,6 +565,8 @@ class AccountService:
                         )
                         t.start()
                 return active_token
+            if session_refreshed:
+                return self._apply_platform_refreshed_tokens(active_token, token_data, event)
             return self._apply_refreshed_tokens(active_token, token_data, event)
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
@@ -957,6 +1048,9 @@ class AccountService:
         score -= min(120.0, consecutive_failures * 30.0)
 
         now = time.time()
+        submitted_at = float(self._image_last_submitted_at.get(token, 0.0))
+        if submitted_at and now - submitted_at < 30.0:
+            score -= 120.0 * (1.0 - max(0.0, now - submitted_at) / 30.0)
         last_failure = self._parse_account_time(account.get("last_image_failure_at"))
         if last_failure and now - last_failure < 15 * 60:
             score -= 70.0
@@ -1003,6 +1097,7 @@ class AccountService:
                     access_token = tokens[0]
                     self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
+                    self._image_last_submitted_at[access_token] = time.time()
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
 
@@ -1023,6 +1118,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1035,7 +1131,11 @@ class AccountService:
             plan_types=plan_types,
         ))
         max_attempts = max(20, min(200, initial_candidate_count + 5))
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = {
+            self.resolve_access_token(token)
+            for token in (excluded_tokens or set())
+            if token
+        }
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1249,6 +1349,7 @@ class AccountService:
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
             for token in target_set:
                 self._image_inflight.pop(token, None)
+                self._image_last_submitted_at.pop(token, None)
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()
@@ -1349,10 +1450,11 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def mark_image_result(self, access_token: str, success: bool, *, release_slot: bool = True) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
+        if release_slot:
+            self.release_image_slot(access_token)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
@@ -1699,7 +1801,7 @@ class AccountService:
 
         items: list[dict[str, str]] = []
         for account in accounts:
-            access_token = str(account.get("access_token") or "").strip()
+            access_token = str(account.get("platform_access_token") or account.get("access_token") or "").strip()
             refresh_token = str(account.get("refresh_token") or "").strip()
             id_token = str(account.get("id_token") or "").strip()
             if not access_token or not refresh_token or not id_token:

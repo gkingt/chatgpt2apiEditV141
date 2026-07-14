@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import random
+import re
 import secrets
 import string
 import threading
@@ -41,6 +42,7 @@ except Exception:
     pass
 
 auth_base = "https://auth.openai.com"
+chatgpt_base = "https://chatgpt.com"
 platform_base = "https://platform.openai.com"
 platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
@@ -376,27 +378,27 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
 
 def request_platform_oauth_token(session: requests.Session, code: str, code_verifier: str) -> dict | None:
     headers = {
-        "accept": "*/*",
+        "accept": "application/json",
         "accept-language": "zh-CN,zh;q=0.9",
         "auth0-client": platform_auth0_client,
         "cache-control": "no-cache",
-        "content-type": "application/json",
-        "origin": platform_base,
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": auth_base,
         "pragma": "no-cache",
         "priority": "u=1, i",
-        "referer": f"{platform_base}/",
+        "referer": f"{auth_base}/",
         "sec-ch-ua": sec_ch_ua,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
+        "sec-fetch-site": "same-origin",
         "user-agent": user_agent,
     }
     resp = session.post(
         f"{auth_base}/api/accounts/oauth/token",
         headers=headers,
-        json={
+        data={
             "client_id": platform_oauth_client_id,
             "code_verifier": code_verifier,
             "grant_type": "authorization_code",
@@ -421,6 +423,7 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.chatgpt_callback_url = ""
 
     def close(self) -> None:
         self.session.close()
@@ -463,7 +466,133 @@ class PlatformRegistrar:
             step(index, f"Cloudflare clearance 刷新失败：{self.clearance_failure_reason}", "yellow")
         return bundle
 
-    def _platform_authorize(self, email: str, index: int) -> None:
+    def _boot_chatgpt_session(self, index: int) -> None:
+        step(index, "开始初始化 ChatGPT 会话")
+        headers = _headers_with_clearance(self._navigate_headers(), chatgpt_base, self.proxy, self.clearance_user_agent)
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            chatgpt_base,
+            headers=headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        if _is_cloudflare_challenge(resp):
+            bundle = self._refresh_cloudflare_clearance(chatgpt_base, index)
+            if bundle is None:
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+            headers = _headers_with_clearance(self._navigate_headers(), chatgpt_base, self.proxy, self.clearance_user_agent)
+            resp, error = request_with_local_retry(
+                self.session,
+                "get",
+                chatgpt_base,
+                headers=headers,
+                allow_redirects=True,
+                verify=False,
+            )
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(error or f"chatgpt_boot_http_{getattr(resp, 'status_code', 'unknown')}")
+        cookies = self.session.cookies.get_dict()
+        self.device_id = str(cookies.get("oai-did") or self.device_id)
+        step(index, "ChatGPT 会话初始化完成")
+
+    def _chatgpt_authorize(self, email: str, index: int) -> None:
+        self._boot_chatgpt_session(index)
+        csrf_url = f"{chatgpt_base}/api/auth/csrf"
+        csrf_browser_headers = {
+            "accept": "application/json",
+            "referer": f"{chatgpt_base}/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": user_agent,
+        }
+        csrf_headers = _headers_with_clearance(
+            csrf_browser_headers,
+            csrf_url,
+            self.proxy,
+            self.clearance_user_agent,
+        )
+        csrf_resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            csrf_url,
+            headers=csrf_headers,
+            verify=False,
+        )
+        csrf_data = _response_json(csrf_resp) if csrf_resp is not None else {}
+        csrf_token = str(csrf_data.get("csrfToken") or "").strip()
+        if csrf_resp is None or csrf_resp.status_code != 200 or not csrf_token:
+            raise RuntimeError(error or f"chatgpt_csrf_http_{getattr(csrf_resp, 'status_code', 'unknown')}")
+
+        query = urlencode({
+            "prompt": "login",
+            "ext-oai-did": self.device_id,
+            "auth_session_logging_id": str(uuid.uuid4()),
+            "ext-passkey-client-capabilities": "0111",
+            "screen_hint": "login_or_signup",
+            "login_hint": email,
+        })
+        signin_url = f"{chatgpt_base}/api/auth/signin/openai?{query}"
+        signin_headers = {
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": chatgpt_base,
+            "referer": f"{chatgpt_base}/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": user_agent,
+        }
+        signin_headers = _headers_with_clearance(signin_headers, signin_url, self.proxy, self.clearance_user_agent)
+        signin_resp, error = request_with_local_retry(
+            self.session,
+            "post",
+            signin_url,
+            data={"callbackUrl": f"{chatgpt_base}/", "csrfToken": csrf_token, "json": "true"},
+            headers=signin_headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        signin_data = _response_json(signin_resp) if signin_resp is not None else {}
+        authorize_url = str(signin_data.get("url") or "").strip()
+        if signin_resp is None or signin_resp.status_code != 200 or not authorize_url:
+            raise RuntimeError(error or f"chatgpt_signin_http_{getattr(signin_resp, 'status_code', 'unknown')}")
+
+        authorize_headers = _headers_with_clearance(
+            self._navigate_headers(f"{chatgpt_base}/"),
+            authorize_url,
+            self.proxy,
+            self.clearance_user_agent,
+        )
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            authorize_url,
+            headers=authorize_headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(error or f"chatgpt_authorize_http_{getattr(resp, 'status_code', 'unknown')}")
+        step(index, f"ChatGPT authorize 完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
+
+    @staticmethod
+    def _oauth_code_from_response(resp) -> str:
+        candidates: list[str] = []
+        for item in [*(getattr(resp, "history", None) or []), resp]:
+            candidates.append(str(getattr(item, "url", "") or ""))
+            location = str((getattr(item, "headers", {}) or {}).get("location") or "")
+            if location:
+                candidates.append(location)
+        for candidate in reversed(candidates):
+            params = extract_oauth_callback_params_from_url(candidate)
+            if params and params.get("code"):
+                return str(params["code"])
+        return ""
+
+    def _platform_authorize(self, email: str, index: int, *, screen_hint: str = "signup") -> None:
         step(index, "开始 platform authorize")
         self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
         self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
@@ -477,7 +606,7 @@ class PlatformRegistrar:
             # 注册流程显式声明 signup：throwaway 域名 OpenAI 会自动当新账号走注册，
             # 但 @outlook.com/@hotmail.com 这类真实消费邮箱会被 login_or_signup 路由到登录分支，
             # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
-            "screen_hint": "signup",
+            "screen_hint": screen_hint,
             "max_age": "0",
             "login_hint": email,
             "scope": "openid profile email offline_access",
@@ -508,9 +637,70 @@ class PlatformRegistrar:
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
         landed = _authorize_landed_page(resp)
+        self.platform_auth_code = self._oauth_code_from_response(resp)
+        if not self.platform_auth_code:
+            body = str(getattr(resp, "text", "") or "")
+            match = re.search(r"[?&]code=([A-Za-z0-9._~+/\-]+)", body) or re.search(
+                r'"code"\s*:\s*"([^"]+)"', body
+            )
+            if match:
+                self.platform_auth_code = str(match.group(1) or "").strip()
+        if screen_hint == "login" and not self.platform_auth_code:
+            raise RuntimeError("platform_authorize_missing_code")
         # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
         # 真正的判定交给 user/register（失败会 dump 完整响应）。
         step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
+
+    def _finish_chatgpt_registration(self, index: int) -> dict[str, str]:
+        callback_url = str(self.chatgpt_callback_url or "").strip()
+        if not callback_url:
+            raise RuntimeError("chatgpt_callback_url_missing")
+        headers = _headers_with_clearance(
+            self._navigate_headers(f"{auth_base}/about-you"),
+            callback_url,
+            self.proxy,
+            self.clearance_user_agent,
+        )
+        resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            callback_url,
+            headers=headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(error or f"chatgpt_callback_http_{getattr(resp, 'status_code', 'unknown')}")
+
+        session_url = f"{chatgpt_base}/api/auth/session"
+        session_headers = {
+            "accept": "application/json",
+            "referer": f"{chatgpt_base}/",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "user-agent": user_agent,
+        }
+        session_headers = _headers_with_clearance(session_headers, session_url, self.proxy, self.clearance_user_agent)
+        session_resp, error = request_with_local_retry(
+            self.session,
+            "get",
+            session_url,
+            headers=session_headers,
+            verify=False,
+        )
+        data = _response_json(session_resp) if session_resp is not None else {}
+        access_token = str(data.get("accessToken") or data.get("access_token") or "").strip()
+        if session_resp is None or session_resp.status_code != 200 or not access_token:
+            raise RuntimeError(error or f"chatgpt_session_http_{getattr(session_resp, 'status_code', 'unknown')}")
+        cookies = self.session.cookies.get_dict()
+        cookie_header = "; ".join(f"{name}={value}" for name, value in cookies.items() if name and value)
+        step(index, f"ChatGPT session token 获取完成 token_len={len(access_token)} cookie_count={len(cookies)}")
+        return {
+            "access_token": access_token,
+            "session_token": str(data.get("sessionToken") or data.get("session_token") or "").strip(),
+            "cookie": cookie_header,
+        }
 
     def _follow_authorize_continue(self, continue_url: str, referer: str, index: int) -> None:
         target_url = str(continue_url or "").strip()
@@ -620,7 +810,8 @@ class PlatformRegistrar:
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         data = _response_json(resp)
-        callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
+        self.chatgpt_callback_url = str(data.get("continue_url") or "").strip()
+        callback_params = extract_oauth_callback_params_from_url(self.chatgpt_callback_url)
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
         step(index, "创建账号资料完成")
 
@@ -644,7 +835,7 @@ class PlatformRegistrar:
         try:
             password = _random_password()
             first_name, last_name = _random_name()
-            self._platform_authorize(email, index)
+            self._chatgpt_authorize(email, index)
             self._register_user(email, password, index)
             self._send_otp(index)
             step(index, "开始等待注册验证码")
@@ -654,6 +845,8 @@ class PlatformRegistrar:
             step(index, f"收到注册验证码: {code}")
             self._validate_otp(code, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            chatgpt_session = self._finish_chatgpt_registration(index)
+            self._platform_authorize(email, index, screen_hint="login")
             tokens = self._exchange_registered_tokens(index)
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
@@ -662,9 +855,12 @@ class PlatformRegistrar:
         return {
             "email": email,
             "password": password,
-            "access_token": str(tokens.get("access_token") or "").strip(),
+            "access_token": str(chatgpt_session.get("access_token") or "").strip(),
+            "platform_access_token": str(tokens.get("access_token") or "").strip(),
             "refresh_token": str(tokens.get("refresh_token") or "").strip(),
             "id_token": str(tokens.get("id_token") or "").strip(),
+            "session_token": str(chatgpt_session.get("session_token") or "").strip(),
+            "cookie": str(chatgpt_session.get("cookie") or "").strip(),
             "source_type": "web",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }

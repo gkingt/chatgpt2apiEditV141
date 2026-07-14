@@ -91,6 +91,24 @@ class AccountExportTests(unittest.TestCase):
         self.assertEqual(items[0]["id_token"], complete_id_token)
         self.assertEqual(items[0]["refresh_token"], "rt_complete")
 
+    def test_build_export_items_prefers_platform_access_token(self) -> None:
+        session_access_token = make_jwt({"exp": 0})
+        platform_access_token = make_jwt({"exp": 1})
+        id_token = make_jwt({"email": "platform@example.com"})
+        service = AccountService(
+            MemoryStorage([{
+                "access_token": session_access_token,
+                "platform_access_token": platform_access_token,
+                "id_token": id_token,
+                "refresh_token": "rt_platform",
+            }])
+        )
+
+        [item] = service.build_export_items()
+
+        self.assertEqual(item["access_token"], platform_access_token)
+        self.assertEqual(item["refresh_token"], "rt_platform")
+
     def test_add_account_items_preserves_export_fields_without_overwriting_plan_type(self) -> None:
         service = AccountService(MemoryStorage())
 

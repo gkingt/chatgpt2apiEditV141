@@ -64,6 +64,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(first["id"], "task-1")
             self.assertEqual(second["id"], "task-1")
+            self.assertEqual(first["status"], "running")
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)

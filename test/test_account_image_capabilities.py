@@ -97,6 +97,75 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_recent_submission_is_spread_to_another_account_after_slot_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "token-a", "status": "正常", "quota": 3},
+                {"access_token": "token-b", "status": "正常", "quota": 3},
+            ])
+            service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(access_token)
+
+            first = service.get_available_access_token()
+            service.release_image_slot(first)
+            second = service.get_available_access_token()
+            service.release_image_slot(second)
+
+            self.assertNotEqual(first, second)
+
+    def test_result_after_early_release_does_not_release_another_submission(self) -> None:
+        original_concurrency = config.data.get("image_account_concurrency")
+        config.data["image_account_concurrency"] = 3
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+                service.add_account_items([{"access_token": "token-a", "status": "正常", "quota": 3}])
+                service.fetch_remote_info = lambda access_token, event="fetch_remote_info": service.get_account(access_token)
+
+                first = service.get_available_access_token()
+                service.release_image_slot(first)
+                second = service.get_available_access_token()
+                service.mark_image_result(first, True, release_slot=False)
+
+                self.assertEqual(service._image_inflight.get(second), 1)
+                service.release_image_slot(second)
+        finally:
+            if original_concurrency is None:
+                config.data.pop("image_account_concurrency", None)
+            else:
+                config.data["image_account_concurrency"] = original_concurrency
+
+    def test_chatgpt_session_and_platform_tokens_refresh_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{
+                "access_token": "session-old",
+                "platform_access_token": "platform-old",
+                "refresh_token": "refresh-old",
+                "cookie": "session=cookie",
+                "status": "正常",
+                "quota": 3,
+            }])
+            service._request_chatgpt_session_refresh = lambda _account: {
+                "access_token": "session-new",
+                "session_token": "session-id-new",
+                "cookie": "session=cookie-new",
+            }
+            service._request_access_token_refresh = lambda _refresh, _account: {
+                "access_token": "platform-new",
+                "refresh_token": "refresh-new",
+                "id_token": "id-new",
+            }
+
+            active = service.refresh_access_token("session-old", force=True, event="test")
+            account = service.get_account(active)
+
+            self.assertEqual(active, "session-new")
+            self.assertEqual(account["platform_access_token"], "platform-new")
+            self.assertEqual(account["refresh_token"], "refresh-new")
+            self.assertEqual(account["session_token"], "session-id-new")
+            self.assertEqual(account["cookie"], "session=cookie-new")
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True

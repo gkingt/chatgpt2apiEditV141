@@ -435,7 +435,7 @@ class ConfigStore:
 
     @property
     def image_redundant_generation_enabled(self) -> bool:
-        value = self.data.get("image_redundant_generation_enabled", True)
+        value = self.data.get("image_redundant_generation_enabled", False)
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)

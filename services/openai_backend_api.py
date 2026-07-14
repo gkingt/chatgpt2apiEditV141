@@ -2179,6 +2179,17 @@ class OpenAIBackendAPI:
                             "error_msg": error_msg,
                             "metadata": metadata,
                         })
+            except UpstreamHTTPError as exc:
+                if exc.status_code == 401:
+                    invalid = InvalidAccessTokenError(f"token invalidated while polling tasks ({conversation_id})")
+                    setattr(invalid, "conversation_id", conversation_id)
+                    raise invalid from exc
+                logger.debug({
+                    "event": "image_poll_task_check_failed",
+                    "conversation_id": conversation_id,
+                    "attempt": attempt,
+                    "error": str(exc),
+                })
             except Exception as exc:
                 # tasks 查询失败不影响正常轮询流程
                 logger.debug({
@@ -2191,6 +2202,10 @@ class OpenAIBackendAPI:
             try:
                 conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
+                if exc.status_code == 401:
+                    invalid = InvalidAccessTokenError(f"token invalidated while polling conversation ({conversation_id})")
+                    setattr(invalid, "conversation_id", conversation_id)
+                    raise invalid from exc
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
                         continue
