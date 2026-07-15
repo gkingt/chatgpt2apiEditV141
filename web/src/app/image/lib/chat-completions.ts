@@ -9,7 +9,17 @@ export type ImageChatConfig = {
   reasoningEffort: string;
 };
 
-export const DEFAULT_CHAT_MODELS = ["auto", "gpt-5-5", "gpt-5-5-thinking", "gpt-5-3", "gpt-5-3-mini", "gpt-5-mini"];
+export const DEFAULT_CHAT_MODELS = [
+  "auto",
+  "gpt-5-6-sol",
+  "gpt-5-6-Luna",
+  "gpt-5-5",
+  "gpt-5-5-thinking",
+  "gpt-5-4-t-mini",
+  "gpt-5-3",
+  "gpt-5-3-mini",
+  "gpt-5-mini",
+];
 
 export function getEffectiveChatModel(config: ImageChatConfig) {
   return config.model === "custom" ? config.customModel.trim() || "auto" : config.model;
