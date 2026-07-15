@@ -210,7 +210,9 @@ function addReferenceMarkupInstructions(
   options: { hasMask: boolean; hasAnnotations: boolean },
 ) {
   const instructions = [
-    options.hasMask ? "只修改参考图透明蒙版标出的区域，未选区域尽量保持原样。" : "",
+    options.hasMask
+      ? "只修改参考图透明蒙版标出的区域，未选区域尽量保持原样。系统会在附件末尾追加绿色半透明蒙版定位图：绿色区域就是必须修改的区域，最终图片中不要保留绿色。"
+      : "",
     options.hasAnnotations
       ? "附加的橙红色钢笔圈线和箭头仅用于定位编辑目标，最终图片中不要保留任何标注线或箭头。"
       : "",

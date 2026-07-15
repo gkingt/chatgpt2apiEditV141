@@ -463,7 +463,7 @@ export function ImageComposer({
                   aria-label={`编辑参考图蒙版和标注 ${image.name || index + 1}`}
                 >
                   <img
-                    src={image.annotationDataUrl || image.dataUrl}
+                    src={image.markupPreviewDataUrl || image.annotationDataUrl || image.dataUrl}
                     alt={image.name || `参考图 ${index + 1}`}
                     className="h-full w-full object-cover"
                   />
@@ -471,7 +471,7 @@ export function ImageComposer({
                     涂抹编辑
                   </span>
                 </button>
-                {image.maskDataUrl || image.annotationDataUrl ? (
+                {image.maskDataUrl || image.annotationDataUrl || image.markupPreviewDataUrl ? (
                   <div className="pointer-events-none absolute -bottom-1 left-1/2 flex -translate-x-1/2 gap-1">
                     {image.maskDataUrl ? <span className="rounded-full bg-emerald-500 px-1.5 py-0.5 text-[8px] font-semibold leading-none text-white shadow">蒙版</span> : null}
                     {image.annotationDataUrl ? <span className="rounded-full bg-orange-500 px-1.5 py-0.5 text-[8px] font-semibold leading-none text-white shadow">标注</span> : null}

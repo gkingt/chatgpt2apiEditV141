@@ -10,12 +10,14 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import api.ai as ai_module
-from services.protocol.openai_v1_image_edit import _composite_mask
+import services.protocol.openai_v1_image_edit as image_edit_module
+from services.protocol.openai_v1_image_edit import _append_mask_instructions, _build_mask_guides, _composite_mask
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 PNG_BYTES = b"\x89PNG\r\n\x1a\n"
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
+ORIGINAL_IMAGE_EDIT_HANDLE = image_edit_module.handle
 
 
 class ImagesEditsApiTests(unittest.TestCase):
@@ -86,6 +88,76 @@ class ImagesEditsApiTests(unittest.TestCase):
 
         self.assertEqual(composited.getpixel((0, 0))[3], 0)
         self.assertEqual(composited.getpixel((1, 0))[3], 255)
+
+    def test_mask_creates_visible_green_guide_for_the_edit_region(self):
+        source_buffer = BytesIO()
+        Image.new("RGBA", (2, 1), (20, 40, 60, 255)).save(source_buffer, format="PNG")
+        mask = Image.new("L", (2, 1), 255)
+        mask.putpixel((0, 0), 0)
+        mask_buffer = BytesIO()
+        mask.save(mask_buffer, format="PNG")
+
+        guides = _build_mask_guides(
+            [(source_buffer.getvalue(), "source.png", "image/png")],
+            [(mask_buffer.getvalue(), "mask.png", "image/png")],
+        )
+        guide = Image.open(BytesIO(guides[0][0])).convert("RGB")
+
+        self.assertEqual(len(guides), 1)
+        self.assertGreater(guide.getpixel((0, 0))[1], guide.getpixel((0, 0))[0])
+        self.assertEqual(guide.getpixel((1, 0)), (20, 40, 60))
+
+    def test_opaque_preserve_mask_does_not_create_guide(self):
+        source_buffer = BytesIO()
+        Image.new("RGB", (1, 1), (20, 40, 60)).save(source_buffer, format="PNG")
+        mask_buffer = BytesIO()
+        Image.new("L", (1, 1), 255).save(mask_buffer, format="PNG")
+
+        guides = _build_mask_guides(
+            [(source_buffer.getvalue(), "source.png", "image/png")],
+            [(mask_buffer.getvalue(), "mask.png", "image/png")],
+        )
+
+        self.assertEqual(guides, [])
+
+    def test_mask_instructions_explain_visible_and_alpha_regions(self):
+        prompt = _append_mask_instructions("replace the plane", 1)
+
+        self.assertIn("附件末尾的 1 张绿色半透明图片", prompt)
+        self.assertIn("透明 Alpha", prompt)
+        self.assertIn("不要保留绿色蒙版", prompt)
+
+    def test_edit_handle_sends_alpha_source_and_visible_guide(self):
+        source_buffer = BytesIO()
+        Image.new("RGBA", (2, 1), (20, 40, 60, 255)).save(source_buffer, format="PNG")
+        mask = Image.new("L", (2, 1), 255)
+        mask.putpixel((0, 0), 0)
+        mask_buffer = BytesIO()
+        mask.save(mask_buffer, format="PNG")
+        captured = {}
+
+        def fake_stream(request):
+            captured["request"] = request
+            return []
+
+        with (
+            mock.patch.object(image_edit_module, "stream_image_outputs_with_pool", side_effect=fake_stream),
+            mock.patch.object(image_edit_module, "collect_image_outputs", return_value={"created": 1, "data": []}),
+        ):
+            ORIGINAL_IMAGE_EDIT_HANDLE({
+                "prompt": "replace the plane",
+                "images": [(source_buffer.getvalue(), "source.png", "image/png")],
+                "mask": [(mask_buffer.getvalue(), "mask.png", "image/png")],
+            })
+
+        request = captured["request"]
+        self.assertEqual(len(request.images), 2)
+        self.assertIn("绿色覆盖区域就是必须修改的区域", request.prompt)
+
+        masked_source = Image.open(BytesIO(base64.b64decode(request.images[0]))).convert("RGBA")
+        visible_guide = Image.open(BytesIO(base64.b64decode(request.images[1]))).convert("RGB")
+        self.assertEqual(masked_source.getpixel((0, 0))[3], 0)
+        self.assertGreater(visible_guide.getpixel((0, 0))[1], visible_guide.getpixel((0, 0))[0])
 
 
 if __name__ == "__main__":

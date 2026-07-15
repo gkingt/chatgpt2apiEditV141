@@ -36,7 +36,7 @@ type ImageMarkupEditorProps = {
   open: boolean;
   image: StoredReferenceImage | null;
   onOpenChange: (open: boolean) => void;
-  onSave: (patch: Pick<StoredReferenceImage, "maskDataUrl" | "annotationDataUrl" | "markupActions">) => void;
+  onSave: (patch: Pick<StoredReferenceImage, "maskDataUrl" | "annotationDataUrl" | "markupPreviewDataUrl" | "markupActions">) => void;
 };
 
 type ImageMarkupEditorSessionProps = Omit<ImageMarkupEditorProps, "open" | "image"> & {
@@ -345,9 +345,29 @@ function ImageMarkupEditorSession({ image, onOpenChange, onSave }: ImageMarkupEd
       }
     }
 
+    let markupPreviewDataUrl: string | undefined;
+    if (hasMask || hasAnnotation) {
+      const preview = createLayerCanvas(canvasSize);
+      const context = preview.getContext("2d");
+      if (context) {
+        context.drawImage(sourceImage, 0, 0, canvasSize.width, canvasSize.height);
+        if (hasMask) {
+          context.save();
+          context.globalAlpha = 0.5;
+          context.drawImage(layers.mask, 0, 0);
+          context.restore();
+        }
+        if (hasAnnotation) {
+          context.drawImage(layers.annotation, 0, 0);
+        }
+        markupPreviewDataUrl = preview.toDataURL("image/png");
+      }
+    }
+
     onSave({
       maskDataUrl,
       annotationDataUrl,
+      markupPreviewDataUrl,
       markupActions: (hasMask || hasAnnotation) && committedActions.length ? committedActions : undefined,
     });
     onOpenChange(false);

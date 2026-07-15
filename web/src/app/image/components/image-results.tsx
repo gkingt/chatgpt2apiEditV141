@@ -152,9 +152,11 @@ export function ImageResults({
   return (
     <div className="mx-auto flex w-full max-w-[980px] flex-col gap-5 sm:gap-8">
       {selectedConversation.turns.map((turn, turnIndex) => {
+        const maskedReferenceCount = turn.referenceImages.filter((image) => Boolean(image.maskDataUrl)).length;
+        const annotatedReferenceCount = turn.referenceImages.filter((image) => Boolean(image.annotationDataUrl)).length;
         const referenceLightboxImages = turn.referenceImages.map((image, index) => ({
           id: `${turn.id}-reference-${index}`,
-          src: image.dataUrl,
+          src: image.markupPreviewDataUrl || image.annotationDataUrl || image.dataUrl,
         }));
         const successfulTurnImages = turn.images.flatMap((image) => {
           const src = image.status === "success" ? getStoredImageSrc(image) : "";
@@ -184,6 +186,20 @@ export function ImageResults({
                     <span>{formatConversationTime(turn.createdAt)}</span>
                   </div>
                   <div className="text-right">{turn.prompt}</div>
+                  {maskedReferenceCount > 0 || annotatedReferenceCount > 0 ? (
+                    <div className="mt-2 flex flex-wrap justify-end gap-1.5 text-[11px]">
+                      {maskedReferenceCount > 0 ? (
+                        <span className="rounded-full bg-emerald-50 px-2.5 py-1 font-medium text-emerald-700">
+                          已发送蒙版 {maskedReferenceCount} 张 · 绿色涂抹为修改区域
+                        </span>
+                      ) : null}
+                      {annotatedReferenceCount > 0 ? (
+                        <span className="rounded-full bg-orange-50 px-2.5 py-1 font-medium text-orange-700">
+                          已发送定位标注 {annotatedReferenceCount} 张
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
                   <div className="mt-2 flex flex-wrap justify-end gap-1.5">
                     <button
                       type="button"
@@ -221,10 +237,20 @@ export function ImageResults({
                               aria-label={`预览参考图 ${image.name || index + 1}`}
                             >
                               <img
-                                src={image.dataUrl}
+                                src={image.markupPreviewDataUrl || image.annotationDataUrl || image.dataUrl}
                                 alt={image.name || `参考图 ${index + 1}`}
                                 className="absolute inset-0 h-full w-full object-cover transition duration-200 group-hover:scale-[1.02]"
                               />
+                              {image.maskDataUrl || image.annotationDataUrl ? (
+                                <span className="absolute left-1.5 top-1.5 flex gap-1">
+                                  {image.maskDataUrl ? (
+                                    <span className="rounded-full bg-emerald-500 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow">蒙版</span>
+                                  ) : null}
+                                  {image.annotationDataUrl ? (
+                                    <span className="rounded-full bg-orange-500 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow">标注</span>
+                                  ) : null}
+                                </span>
+                              ) : null}
                             </button>
                             <Button
                               variant="outline"

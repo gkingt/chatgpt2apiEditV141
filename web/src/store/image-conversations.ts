@@ -26,6 +26,7 @@ export type StoredReferenceImage = {
   dataUrl: string;
   maskDataUrl?: string;
   annotationDataUrl?: string;
+  markupPreviewDataUrl?: string;
   markupActions?: ImageMarkupAction[];
 };
 
@@ -149,6 +150,10 @@ function normalizeReferenceImage(image: StoredReferenceImage): StoredReferenceIm
     annotationDataUrl:
       typeof image.annotationDataUrl === "string" && image.annotationDataUrl
         ? image.annotationDataUrl
+        : undefined,
+    markupPreviewDataUrl:
+      typeof image.markupPreviewDataUrl === "string" && image.markupPreviewDataUrl
+        ? image.markupPreviewDataUrl
         : undefined,
     markupActions: markupActions?.length ? markupActions : undefined,
   };
