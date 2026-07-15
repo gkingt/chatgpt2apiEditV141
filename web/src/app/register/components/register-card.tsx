@@ -1,6 +1,7 @@
 "use client";
 
-import { AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Square, Trash2, UserPlus } from "lucide-react";
+import { Activity, AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Settings2, Square, Trash2, UserPlus } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -8,10 +9,13 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 
 import { useSettingsStore } from "../../settings/store";
 
 export function RegisterCard() {
+  const [mobileView, setMobileView] = useState<"config" | "results">("config");
+  const selectedInitialMobileView = useRef(false);
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
   const isSaving = useSettingsStore((state) => state.isSavingRegister);
@@ -31,6 +35,12 @@ export function RegisterCard() {
   const toggle = useSettingsStore((state) => state.toggleRegister);
   const reset = useSettingsStore((state) => state.resetRegister);
   const resetOutlookPool = useSettingsStore((state) => state.resetOutlookPool);
+
+  useEffect(() => {
+    if (!config || selectedInitialMobileView.current) return;
+    selectedInitialMobileView.current = true;
+    setMobileView(config.enabled ? "results" : "config");
+  }, [config]);
 
   if (isLoading) {
     return (
@@ -63,8 +73,17 @@ export function RegisterCard() {
   };
 
   return (
-    <div className="grid h-[calc(100vh-132px)] min-h-[640px] items-stretch gap-0 overflow-hidden rounded-xl border border-stone-200 bg-white/70 xl:grid-cols-2">
-      <section className="space-y-4 overflow-y-auto border-b border-stone-200 p-4 xl:border-r xl:border-b-0">
+    <>
+    <div className="grid h-[calc(100dvh-8.25rem)] min-h-[460px] items-stretch gap-0 overflow-hidden rounded-xl border border-stone-200 bg-white/70 sm:h-[calc(100dvh-132px)] sm:min-h-[640px] xl:grid-cols-2">
+      <section
+        id="register-config-panel"
+        role="tabpanel"
+        aria-label="注册配置"
+        className={cn(
+          "space-y-4 overflow-y-auto border-stone-200 p-4 pb-24 xl:block xl:border-r xl:pb-4",
+          mobileView !== "config" && "hidden",
+        )}
+      >
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-center gap-3">
               <div className="flex size-9 items-center justify-center rounded-md bg-stone-100">
@@ -385,7 +404,15 @@ export function RegisterCard() {
 
       </section>
 
-      <section className="flex min-h-0 flex-col p-4">
+      <section
+        id="register-results-panel"
+        role="tabpanel"
+        aria-label="运行结果"
+        className={cn(
+          "min-h-0 flex-col p-4 pb-24 xl:flex xl:pb-4",
+          mobileView === "results" ? "flex" : "hidden",
+        )}
+      >
         <div className="space-y-3">
             <div className="flex items-start justify-between gap-3">
               <div>
@@ -396,7 +423,7 @@ export function RegisterCard() {
                 {config.enabled ? "运行中" : "已停止"}
               </Badge>
             </div>
-            <div className="grid grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {[
                 ["成功 / 成功率", `${stats.success} / ${stats.success_rate || 0}%`],
                 ["失败", stats.fail],
@@ -443,14 +470,14 @@ export function RegisterCard() {
                 {logs.length}
               </Badge>
             </div>
-            <div className="min-h-0 flex-1 overflow-y-auto border border-stone-200 bg-white/70 p-3 font-mono text-xs leading-6">
+            <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto border border-stone-200 bg-white/70 p-3 font-mono text-xs leading-6">
               {logs.length === 0 ? (
                 <div className="text-stone-500">暂无日志</div>
               ) : (
                 logs.slice().reverse().map((item, index) => (
                   <div key={`${item.time}-${index}`} className={item.level === "red" ? "text-rose-600" : item.level === "green" ? "text-emerald-700" : item.level === "yellow" ? "text-amber-700" : "text-stone-700"}>
                     <span className="text-stone-400">{new Date(item.time).toLocaleTimeString()}</span>
-                    <span className="pl-2">{item.text}</span>
+                    <span className="break-words pl-2 [overflow-wrap:anywhere]">{item.text}</span>
                   </div>
                 ))
               )}
@@ -458,5 +485,50 @@ export function RegisterCard() {
         </div>
       </section>
     </div>
+    <div
+      role="tablist"
+      aria-label="注册页面视图"
+      className="fixed bottom-[calc(env(safe-area-inset-bottom)+1rem)] left-[max(1rem,env(safe-area-inset-left))] z-50 flex items-center gap-1 rounded-2xl border border-stone-200/90 bg-white/95 p-1.5 shadow-[0_18px_55px_-18px_rgba(28,25,23,0.45)] backdrop-blur-xl xl:hidden dark:border-white/10 dark:bg-stone-900/95"
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mobileView === "config"}
+        aria-controls="register-config-panel"
+        onClick={() => setMobileView("config")}
+        className={cn(
+          "inline-flex h-10 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition",
+          mobileView === "config"
+            ? "bg-stone-950 text-white shadow-sm dark:bg-white dark:text-stone-950"
+            : "text-stone-500 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-300 dark:hover:bg-white/10 dark:hover:text-white",
+        )}
+      >
+        <Settings2 className="size-4" />
+        配置
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mobileView === "results"}
+        aria-controls="register-results-panel"
+        onClick={() => setMobileView("results")}
+        className={cn(
+          "inline-flex h-10 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition",
+          mobileView === "results"
+            ? "bg-stone-950 text-white shadow-sm dark:bg-white dark:text-stone-950"
+            : "text-stone-500 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-300 dark:hover:bg-white/10 dark:hover:text-white",
+        )}
+      >
+        <span className="relative">
+          <Activity className="size-4" />
+          {config.enabled ? <span className="absolute -right-1 -top-1 size-2 rounded-full border border-white bg-emerald-500" /> : null}
+        </span>
+        运行结果
+        {stats.fail > 0 ? (
+          <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] leading-none", mobileView === "results" ? "bg-white/15 text-white dark:bg-stone-900/15 dark:text-stone-900" : "bg-rose-50 text-rose-600")}>{stats.fail}</span>
+        ) : null}
+      </button>
+    </div>
+    </>
   );
 }
