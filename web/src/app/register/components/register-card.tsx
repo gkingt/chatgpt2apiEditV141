@@ -61,7 +61,7 @@ export function RegisterCard() {
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
       ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [] } : {}),
-      ...(type === "tempmail_lol" ? { api_key: "", domain: [], rate_per_window: 24, window_seconds: 300, max_wait: 600, create_total_budget: 90, domain_cooldown_threshold: 3, domain_cooldown_seconds: 21600 } : {}),
+      ...(type === "tempmail_lol" ? { api_key: "", rate_per_window: 24, window_seconds: 300, max_wait: 600, create_total_budget: 90 } : {}),
       ...(type === "moemail" ? { api_base: "", api_key: "", domain: [] } : {}),
       ...(type === "inbucket" ? { api_base: "", domain: [], random_subdomain: true } : {}),
       ...(type === "duckmail" ? { api_key: "", default_domain: "duckmail.sbs" } : {}),
@@ -301,14 +301,6 @@ export function RegisterCard() {
                             <label className="text-sm text-stone-700">网络错误重试预算（秒，不含限流等待）</label>
                             <Input type="number" min={15} value={String(provider.create_total_budget ?? 90)} onChange={(event) => updateProvider(index, { create_total_budget: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                           </div>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">域名连续超时阈值</label>
-                            <Input type="number" min={1} value={String(provider.domain_cooldown_threshold ?? 3)} onChange={(event) => updateProvider(index, { domain_cooldown_threshold: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">域名冷却时间（秒）</label>
-                            <Input type="number" min={60} value={String(provider.domain_cooldown_seconds ?? 21600)} onChange={(event) => updateProvider(index, { domain_cooldown_seconds: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
                         </>
                       ) : null}
                       {type === "duckmail" || type === "gptmail" ? (
@@ -362,10 +354,9 @@ export function RegisterCard() {
                             <div key={String(item.domain || "unknown")} className="rounded-md bg-stone-50 px-2.5 py-2 text-xs text-stone-600">
                               <div className="flex items-center justify-between gap-2 font-medium text-stone-800">
                                 <span className="truncate">{String(item.domain || "unknown")}</span>
-                                {item.cooling ? <span className="text-amber-600">冷却中</span> : null}
                               </div>
                               <div className="mt-1">收到 {Number(item.received || 0)} · 超时 {Number(item.timeouts || 0)} · 成功率 {Number(item.success_rate || 0)}%</div>
-                              <div className="mt-0.5 text-stone-400">连续超时 {Number(item.consecutive_timeouts || 0)} · 跳过 {Number(item.skipped || 0)}</div>
+                              <div className="mt-0.5 text-stone-400">仅统计，不限制或跳过域名</div>
                             </div>
                           ))}
                         </div>
@@ -410,11 +401,10 @@ export function RegisterCard() {
                       );
                     })() : null}
 
-                    {type === "cloudmail_gen" || type === "tempmail_lol" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
+                    {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
                       <div className="space-y-2">
-                        <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "inbucket" ? "基础域名列表" : type === "tempmail_lol" ? "自定义域名（支持多域名/通配子域）" : "Domain"}</label>
-                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "tempmail_lol" ? "example.com\n*.example.com" : type === "moemail" ? "每行一个域名" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
-                        {type === "tempmail_lol" ? <p className="text-xs leading-5 text-stone-500">使用 <code>*.example.com</code> 时，每次创建都会随机生成子域名和邮箱前缀；请先在 TempMail.lol 后台配置 catch-all/通配解析。</p> : null}
+                        <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "inbucket" ? "基础域名列表" : "Domain"}</label>
+                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
                       </div>
                     ) : null}
                     {type === "cloudmail_gen" ? (

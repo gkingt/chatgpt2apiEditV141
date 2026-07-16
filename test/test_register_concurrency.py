@@ -11,6 +11,29 @@ from services import register_service as register_service_module
 
 
 class RegisterConcurrencyTests(unittest.TestCase):
+    def test_normalize_removes_tempmail_domain_restrictions(self) -> None:
+        config = register_service_module._normalize(
+            {
+                "mail": {
+                    "providers": [
+                        {
+                            "type": "tempmail_lol",
+                            "enable": True,
+                            "api_key": "test-key",
+                            "domain": ["whitelist.example"],
+                            "domain_cooldown_threshold": 3,
+                            "domain_cooldown_seconds": 21600,
+                        }
+                    ]
+                }
+            }
+        )
+
+        provider = config["mail"]["providers"][0]
+        self.assertNotIn("domain", provider)
+        self.assertNotIn("domain_cooldown_threshold", provider)
+        self.assertNotIn("domain_cooldown_seconds", provider)
+
     def test_start_applies_three_threads_atomically_and_runs_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = register_service_module.RegisterService(Path(temp_dir) / "register.json")

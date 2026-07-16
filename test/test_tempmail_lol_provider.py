@@ -55,15 +55,11 @@ class TempMailLolProviderTests(unittest.TestCase):
         with mock.patch.object(mail_provider, "_create_session", return_value=session):
             return mail_provider.TempMailLolProvider(entry, dict(self.conf))
 
-    def test_parses_multiple_keys_and_domains(self) -> None:
+    def test_parses_multiple_keys(self) -> None:
         self.assertEqual(mail_provider._parse_tempmail_keys(" key-a, key-b\nkey-a "), ["key-a", "key-b"])
         self.assertEqual(mail_provider._parse_tempmail_keys(""), [""])
-        self.assertEqual(
-            mail_provider._parse_tempmail_domains(["https://Mail.Example.com/path", "*.alt.example.com"]),
-            ["mail.example.com", "*.alt.example.com"],
-        )
 
-    def test_create_rotates_key_after_429_and_randomizes_wildcard_domain(self) -> None:
+    def test_create_rotates_key_after_429_without_domain_filter(self) -> None:
         session = FakeSession(
             [
                 FakeResponse(429, {"error": "rate limited"}, "rate limited"),
@@ -93,8 +89,8 @@ class TempMailLolProviderTests(unittest.TestCase):
         second_payload = session.requests[1]["json"]
         self.assertIsInstance(second_payload, dict)
         assert isinstance(second_payload, dict)
-        self.assertRegex(str(second_payload["domain"]), r"^[a-z][a-z0-9]{4}\.example\.com$")
-        self.assertTrue(re.fullmatch(r"[a-z0-9]{12}", str(second_payload["prefix"])))
+        self.assertNotIn("domain", second_payload)
+        self.assertTrue(re.fullmatch(r"[a-z]{5}\d{1,3}[a-z]{1,3}", str(second_payload["prefix"])))
 
     def test_create_fails_fast_for_fatal_4xx(self) -> None:
         session = FakeSession([FakeResponse(403, {"error": "forbidden"}, "forbidden")])
@@ -138,8 +134,8 @@ class TempMailLolProviderTests(unittest.TestCase):
             [{"Authorization": "Bearer key-one"}, {"Authorization": "Bearer key-two"}],
         )
 
-    def test_invalid_domain_is_rejected_before_request(self) -> None:
-        session = FakeSession([])
+    def test_configured_domain_is_ignored_and_created_address_is_accepted(self) -> None:
+        session = FakeSession([FakeResponse(201, {"address": "mail@random-provider.example", "token": "token"})])
         provider = self.make_provider(
             {
                 "provider_ref": "tempmail-test-domain",
@@ -149,9 +145,11 @@ class TempMailLolProviderTests(unittest.TestCase):
             session,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "自定义域名无效"):
-            provider.create_mailbox()
-        self.assertEqual(session.requests, [])
+        mailbox = provider.create_mailbox()
+
+        self.assertEqual(mailbox["address"], "mail@random-provider.example")
+        self.assertEqual(len(session.requests), 1)
+        self.assertNotIn("domain", session.requests[0]["json"])
 
     def test_key_pool_enforces_sliding_window_limit(self) -> None:
         pool = mail_provider._TempMailKeyPool(["only-key"], rate=1, window=300)
@@ -301,7 +299,7 @@ class TempMailLolProviderTests(unittest.TestCase):
         self.assertNotIn("api-secret", summary)
         self.assertNotIn("token-secret", summary)
 
-    def test_cooled_domain_is_skipped_and_replaced(self) -> None:
+    def test_domain_history_never_skips_created_address(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
             mail_provider, "TEMPMAIL_DOMAIN_STATS_FILE", Path(temp_dir) / "domain-stats.json"
         ):
@@ -309,20 +307,17 @@ class TempMailLolProviderTests(unittest.TestCase):
                 mail_provider._record_tempmail_domain_result(
                     "abc.airfryersbg.com",
                     received=False,
-                    cooldown_threshold=3,
-                    cooldown_seconds=600,
                 )
             session = FakeSession(
                 [
-                    FakeResponse(201, {"address": "bad@next.airfryersbg.com", "token": "discarded-token"}),
-                    FakeResponse(201, {"address": "good@tal.gardianwaves.org", "token": "accepted-token"}),
+                    FakeResponse(201, {"address": "direct@next.airfryersbg.com", "token": "accepted-token"}),
                 ]
             )
             provider = self.make_provider(
                 {
                     "provider_ref": "tempmail-domain-cooldown",
                     "api_key": "key",
-                    "domain": [],
+                    "domain": ["whitelist.example"],
                     "max_wait": 0,
                     "domain_cooldown_threshold": 3,
                     "domain_cooldown_seconds": 600,
@@ -333,17 +328,16 @@ class TempMailLolProviderTests(unittest.TestCase):
             mailbox = provider.create_mailbox()
             stats = {item["domain"]: item for item in mail_provider.tempmail_domain_stats_snapshot()}
 
-        self.assertEqual(mailbox["address"], "good@tal.gardianwaves.org")
-        self.assertEqual(len(session.requests), 2)
-        self.assertTrue(stats["airfryersbg.com"]["cooling"])
-        self.assertEqual(stats["airfryersbg.com"]["skipped"], 1)
+        self.assertEqual(mailbox["address"], "direct@next.airfryersbg.com")
+        self.assertEqual(len(session.requests), 1)
+        self.assertNotIn("domain", session.requests[0]["json"])
+        self.assertEqual(stats["airfryersbg.com"]["consecutive_timeouts"], 3)
+        self.assertNotIn("cooling", stats["airfryersbg.com"])
 
     def test_delivery_result_is_recorded_only_once_per_mailbox(self) -> None:
         mailbox = {
             "provider": "tempmail_lol",
             "address": "mail@tal.gardianwaves.org",
-            "_domain_cooldown_threshold": 3,
-            "_domain_cooldown_seconds": 600,
         }
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
             mail_provider, "TEMPMAIL_DOMAIN_STATS_FILE", Path(temp_dir) / "domain-stats.json"

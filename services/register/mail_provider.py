@@ -14,7 +14,7 @@ from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from threading import Lock
 from typing import Any, Callable, TypeVar
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from curl_cffi import requests
 
@@ -992,7 +992,6 @@ class CloudMailGenProvider(BaseMailProvider):
 
 TEMPMAIL_LOL_API_BASE = "https://api.tempmail.lol/v2"
 _TEMPMAIL_KEY_SPLIT_RE = re.compile(r"[\s,，;；]+")
-_TEMPMAIL_DOMAIN_SPLIT_RE = re.compile(r"[\s,，;；]+")
 _TEMPMAIL_TRANSIENT_STATUSES = {500, 502, 503, 504, 520, 521, 522, 523, 524}
 TEMPMAIL_DOMAIN_STATS_FILE = DATA_DIR / "tempmail_domain_stats.json"
 _tempmail_domain_stats_lock = Lock()
@@ -1026,100 +1025,41 @@ def _save_tempmail_domain_stats(stats: dict[str, dict[str, Any]]) -> None:
     temp_file.replace(TEMPMAIL_DOMAIN_STATS_FILE)
 
 
-def _tempmail_cooldown_until(entry: dict[str, Any]) -> datetime | None:
-    try:
-        value = datetime.fromisoformat(str(entry.get("cooldown_until") or ""))
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
-
-
-def _tempmail_domain_cooldown_remaining(domain: str) -> float:
-    root = _tempmail_root_domain(domain)
-    if not root:
-        return 0.0
-    with _tempmail_domain_stats_lock:
-        stats = _load_tempmail_domain_stats()
-        entry = stats.get(root)
-        if not isinstance(entry, dict):
-            return 0.0
-        until = _tempmail_cooldown_until(entry)
-        if until is None:
-            return 0.0
-        remaining = (until - datetime.now(timezone.utc)).total_seconds()
-        if remaining > 0:
-            return remaining
-        entry["cooldown_until"] = ""
-        entry["consecutive_timeouts"] = 0
-        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-        _save_tempmail_domain_stats(stats)
-        return 0.0
-
-
 def _record_tempmail_domain_result(
     domain: str,
     *,
     received: bool,
-    cooldown_threshold: int,
-    cooldown_seconds: float,
 ) -> None:
     root = _tempmail_root_domain(domain)
     if not root:
         return
     now = datetime.now(timezone.utc)
-    entered_cooldown = False
     with _tempmail_domain_stats_lock:
         stats = _load_tempmail_domain_stats()
         entry = stats.setdefault(root, {})
         entry["received"] = int(entry.get("received") or 0)
         entry["timeouts"] = int(entry.get("timeouts") or 0)
-        entry["skipped"] = int(entry.get("skipped") or 0)
         entry["consecutive_timeouts"] = int(entry.get("consecutive_timeouts") or 0)
         if received:
             entry["received"] += 1
             entry["consecutive_timeouts"] = 0
-            entry["cooldown_until"] = ""
         else:
             entry["timeouts"] += 1
             entry["consecutive_timeouts"] += 1
-            if entry["consecutive_timeouts"] >= max(1, cooldown_threshold):
-                entry["cooldown_until"] = (now + timedelta(seconds=max(60.0, cooldown_seconds))).isoformat()
-                entered_cooldown = True
+        # Domain history is passive telemetry only; it never blocks an address.
+        entry.pop("cooldown_until", None)
+        entry.pop("skipped", None)
         entry["updated_at"] = now.isoformat()
-        _save_tempmail_domain_stats(stats)
-        consecutive_timeouts = entry["consecutive_timeouts"]
-    if entered_cooldown:
-        _provider_log(
-            f"TempMail.lol 域名进入冷却: domain={root}, consecutive_timeouts={consecutive_timeouts}, "
-            f"cooldown_seconds={max(60.0, cooldown_seconds):.0f}"
-        )
-
-
-def _record_tempmail_domain_skip(domain: str) -> None:
-    root = _tempmail_root_domain(domain)
-    if not root:
-        return
-    with _tempmail_domain_stats_lock:
-        stats = _load_tempmail_domain_stats()
-        entry = stats.setdefault(root, {})
-        entry["received"] = int(entry.get("received") or 0)
-        entry["timeouts"] = int(entry.get("timeouts") or 0)
-        entry["consecutive_timeouts"] = int(entry.get("consecutive_timeouts") or 0)
-        entry["skipped"] = int(entry.get("skipped") or 0) + 1
-        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
         _save_tempmail_domain_stats(stats)
 
 
 def tempmail_domain_stats_snapshot() -> list[dict[str, Any]]:
     with _tempmail_domain_stats_lock:
         stats = _load_tempmail_domain_stats()
-    now = datetime.now(timezone.utc)
     result: list[dict[str, Any]] = []
     for domain, entry in stats.items():
         received = int(entry.get("received") or 0)
         timeouts = int(entry.get("timeouts") or 0)
-        until = _tempmail_cooldown_until(entry)
-        remaining = max(0.0, (until - now).total_seconds()) if until is not None else 0.0
         result.append(
             {
                 "domain": domain,
@@ -1127,12 +1067,9 @@ def tempmail_domain_stats_snapshot() -> list[dict[str, Any]]:
                 "timeouts": timeouts,
                 "success_rate": round(received * 100 / max(1, received + timeouts), 1),
                 "consecutive_timeouts": int(entry.get("consecutive_timeouts") or 0),
-                "skipped": int(entry.get("skipped") or 0),
-                "cooling": remaining > 0,
-                "cooldown_remaining_seconds": round(remaining),
             }
         )
-    return sorted(result, key=lambda item: (-int(item["cooling"]), float(item["success_rate"]), str(item["domain"])))
+    return sorted(result, key=lambda item: (float(item["success_rate"]), str(item["domain"])))
 
 
 def mark_verification_code_received(mailbox: dict[str, Any]) -> None:
@@ -1141,8 +1078,6 @@ def mark_verification_code_received(mailbox: dict[str, Any]) -> None:
     _record_tempmail_domain_result(
         str(mailbox.get("address") or ""),
         received=True,
-        cooldown_threshold=int(mailbox.get("_domain_cooldown_threshold") or 3),
-        cooldown_seconds=float(mailbox.get("_domain_cooldown_seconds") or 21600),
     )
     mailbox["_domain_delivery_recorded"] = True
 
@@ -1153,8 +1088,6 @@ def _mark_tempmail_verification_timeout(mailbox: dict[str, Any]) -> None:
     _record_tempmail_domain_result(
         str(mailbox.get("address") or ""),
         received=False,
-        cooldown_threshold=int(mailbox.get("_domain_cooldown_threshold") or 3),
-        cooldown_seconds=float(mailbox.get("_domain_cooldown_seconds") or 21600),
     )
     mailbox["_domain_delivery_recorded"] = True
 
@@ -1174,42 +1107,6 @@ def _parse_tempmail_keys(raw: Any) -> list[str]:
     return keys or [""]
 
 
-def _clean_tempmail_domain(raw: Any) -> str:
-    domain = str(raw or "").strip().lower()
-    if not domain:
-        return ""
-    if "://" in domain:
-        try:
-            parsed = urlsplit(domain)
-            domain = parsed.netloc or parsed.path or ""
-        except Exception:
-            return ""
-    domain = domain.strip().lstrip("@").strip()
-    wildcard = domain.startswith("*.")
-    if wildcard:
-        domain = domain[2:]
-    domain = domain.strip(".")
-    if not domain or "." not in domain or any(char in domain for char in (" ", ",", "/", ":", "*", "@")):
-        return ""
-    return f"*.{domain}" if wildcard else domain
-
-
-def _parse_tempmail_domains(raw: Any) -> list[str]:
-    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
-    domains: list[str] = []
-    for value in values:
-        for piece in _TEMPMAIL_DOMAIN_SPLIT_RE.split(str(value or "")):
-            domain = _clean_tempmail_domain(piece)
-            if domain and domain not in domains:
-                domains.append(domain)
-    return domains
-
-
-def _tempmail_has_domain_input(raw: Any) -> bool:
-    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
-    return any(str(value or "").strip() for value in values)
-
-
 def _tempmail_int(value: Any, default: int) -> int:
     try:
         return int(value)
@@ -1222,16 +1119,6 @@ def _tempmail_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _random_tempmail_subdomain(length: int = 5) -> str:
-    first = random.choice(string.ascii_lowercase)
-    rest = "".join(random.choices(string.ascii_lowercase + string.digits, k=max(1, length - 1)))
-    return first + rest
-
-
-def _random_tempmail_prefix(length: int = 12) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=max(1, length)))
 
 
 class _TempMailKeyPool:
@@ -1355,27 +1242,15 @@ class TempMailLolProvider(BaseMailProvider):
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         raw_keys = entry.get("api_key") or entry.get("tempmail_api_key") or ""
-        raw_domains = entry.get("domain") if entry.get("domain") is not None else entry.get("tempmail_domain")
         self.api_keys = _parse_tempmail_keys(raw_keys)
-        self.domains = _parse_tempmail_domains(raw_domains)
-        self.invalid_domain_config = _tempmail_has_domain_input(raw_domains) and not self.domains
         self.rate_per_window = max(1, _tempmail_int(entry.get("rate_per_window", entry.get("tempmail_rate_per_window", 24)), 24))
         self.window_seconds = max(10.0, _tempmail_float(entry.get("window_seconds", entry.get("tempmail_window_seconds", 300)), 300))
         self.max_wait = max(0.0, _tempmail_float(entry.get("max_wait", entry.get("tempmail_max_wait", 600)), 600))
         self.create_total_budget = max(15.0, _tempmail_float(entry.get("create_total_budget", entry.get("tempmail_create_total_budget", 90)), 90))
-        self.domain_cooldown_threshold = max(1, _tempmail_int(entry.get("domain_cooldown_threshold", 3), 3))
-        self.domain_cooldown_seconds = max(60.0, _tempmail_float(entry.get("domain_cooldown_seconds", 21600), 21600))
         self.key_pool = _get_tempmail_pool(self.provider_ref, self.api_keys, self.rate_per_window, self.window_seconds)
         self._last_status_code: int | None = None
         self.session = _create_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json"})
-
-    @staticmethod
-    def _resolve_domain(domain: str) -> tuple[str, bool]:
-        text = str(domain or "").strip().lower()
-        if text.startswith("*.") and len(text) > 2:
-            return f"{_random_tempmail_subdomain()}.{text[2:]}", True
-        return text, False
 
     def _request(self, method: str, path: str, *, api_key: str | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)) -> dict[str, Any]:
         selected_key = self.api_keys[0] if api_key is None else api_key
@@ -1413,9 +1288,6 @@ class TempMailLolProvider(BaseMailProvider):
         return data
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        if self.invalid_domain_config:
-            raise RuntimeError("TempMail.lol 自定义域名无效；请填写完整域名，支持多域名及 *.example.com 通配子域")
-
         max_attempts = max(4, len(self.api_keys) * 2 + 2)
         deadline = time.monotonic() + self.create_total_budget
         backoff = 1.0
@@ -1430,11 +1302,6 @@ class TempMailLolProvider(BaseMailProvider):
             # can become available after the transient-request budget has elapsed.
             api_key = self.key_pool.acquire(self.max_wait)
             payload: dict[str, Any] = {"prefix": username or _random_mailbox_name()}
-            if self.domains:
-                domain, force_random_prefix = self._resolve_domain(random.choice(self.domains))
-                payload["domain"] = domain
-                if force_random_prefix:
-                    payload["prefix"] = _random_tempmail_prefix()
 
             try:
                 data = self._request("POST", "/inbox/create", api_key=api_key, payload=payload, expected=(200, 201))
@@ -1456,24 +1323,12 @@ class TempMailLolProvider(BaseMailProvider):
             if not address or not token:
                 last_error = RuntimeError("TempMail.lol 响应缺少 address/token")
                 continue
-            cooldown_remaining = _tempmail_domain_cooldown_remaining(address)
-            if cooldown_remaining > 0:
-                root_domain = _tempmail_root_domain(address)
-                _record_tempmail_domain_skip(root_domain)
-                _provider_log(
-                    f"TempMail.lol 跳过冷却域名: domain={root_domain}, "
-                    f"cooldown_remaining_seconds={cooldown_remaining:.0f}"
-                )
-                last_error = RuntimeError(f"TempMail.lol 域名正在冷却: {root_domain}")
-                continue
             _remember_tempmail_token_key(token, api_key)
             return {
                 "provider": self.name,
                 "provider_ref": self.provider_ref,
                 "address": address,
                 "token": token,
-                "_domain_cooldown_threshold": self.domain_cooldown_threshold,
-                "_domain_cooldown_seconds": self.domain_cooldown_seconds,
             }
 
         raise RuntimeError(

@@ -73,6 +73,10 @@ def _normalize(raw: dict) -> dict:
         for provider in providers:
             if isinstance(provider, dict):
                 provider.pop("domain_stats", None)
+                if provider.get("type") == "tempmail_lol":
+                    provider.pop("domain", None)
+                    provider.pop("domain_cooldown_threshold", None)
+                    provider.pop("domain_cooldown_seconds", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
