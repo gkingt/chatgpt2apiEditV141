@@ -1519,6 +1519,12 @@ class TempMailLolProvider(BaseMailProvider):
         item = max(messages, key=lambda value: ((_parse_received_at(value.get("created_at") or value.get("createdAt") or value.get("date") or value.get("received_at") or value.get("timestamp")) or datetime.fromtimestamp(0, tz=timezone.utc)).timestamp(), str(value.get("id") or value.get("token") or "")))
         return self._message_from_item(mailbox, item)
 
+    def prepare_code_baseline(self, mailbox: dict[str, Any]) -> None:
+        # A newly created TempMail.lol inbox has no legitimate pre-existing OTP.
+        # Avoid the extra pre-send read used by reusable providers: the API can
+        # expose a just-delivered OTP during that read and incorrectly reject it.
+        mailbox["_code_not_before"] = datetime.now(timezone.utc) - timedelta(minutes=2)
+
     def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
         if not isinstance(seen_value, list):
@@ -1538,6 +1544,7 @@ class TempMailLolProvider(BaseMailProvider):
         scanned = 0
         boundary_filtered = 0
         no_code = 0
+        rejected_codes = 0
         cooldown_pauses = 0
         key_switches = 0
         last_batch = 0
@@ -1550,7 +1557,8 @@ class TempMailLolProvider(BaseMailProvider):
                 f"successful_queries={successful_queries}, empty_inboxes={empty_inboxes}, "
                 f"http_429={http_429}, http_5xx={http_5xx}, other_errors={other_errors}, "
                 f"last_status={last_status if last_status is not None else 'none'}, last_batch={last_batch}, "
-                f"scanned={scanned}, no_code={no_code}, boundary_filtered={boundary_filtered}, "
+                f"scanned={scanned}, no_code={no_code}, rejected_codes={rejected_codes}, "
+                f"boundary_filtered={boundary_filtered}, "
                 f"cooldown_pauses={cooldown_pauses}, key_switches={key_switches}"
             )
 
@@ -1625,16 +1633,17 @@ class TempMailLolProvider(BaseMailProvider):
                     continue
                 scanned += 1
                 code = _extract_code(message)
-                if code and not _verification_code_rejected(mailbox, code):
+                if code and _verification_code_rejected(mailbox, code):
+                    rejected_codes += 1
+                    seen_refs.add(ref)
+                    seen_value.append(ref)
+                    continue
+                if code:
                     seen_refs.add(ref)
                     seen_value.append(ref)
                     log_diagnostics("命中")
                     return code
-                if code:
-                    seen_refs.add(ref)
-                    seen_value.append(ref)
-                else:
-                    no_code += 1
+                no_code += 1
             time.sleep(max(0.2, self.conf["wait_interval"]))
         log_diagnostics("超时")
         return None

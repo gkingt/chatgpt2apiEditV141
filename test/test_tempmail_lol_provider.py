@@ -224,6 +224,21 @@ class TempMailLolProviderTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         self.assertEqual(len(session.requests), 2)
 
+    def test_pre_send_baseline_does_not_consume_just_delivered_code(self) -> None:
+        entry = {"provider_ref": "tempmail-baseline", "api_key": "key", "domain": []}
+        session = FakeSession(
+            [FakeResponse(200, {"emails": [{"id": "new-message", "subject": "Verification code: 846210"}]})]
+        )
+        provider = self.make_provider(entry, session)
+        mailbox = {"address": "mail@example.com", "token": "token-baseline"}
+
+        provider.prepare_code_baseline(mailbox)
+        code = provider.wait_for_code(mailbox)
+
+        self.assertEqual(code, "846210")
+        self.assertEqual(len(session.requests), 1)
+        self.assertEqual(mailbox.get("_rejected_verification_codes"), [])
+
     def test_poll_accepts_unseen_message_id_despite_clock_skew(self) -> None:
         entry = {"provider_ref": "tempmail-clock-skew", "api_key": "key", "domain": []}
         session = FakeSession(
