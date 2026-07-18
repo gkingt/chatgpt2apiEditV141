@@ -124,6 +124,91 @@ class CloudflareTempMailNoCooldownTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         self.assertEqual(len(session.calls), 2)
 
+    def test_observed_cloudflare_payload_shape_parses_raw_mime_code(self):
+        raw_mime = (
+            "From: ChatGPT <noreply@example.test>\r\n"
+            "To: user@example.test\r\n"
+            "Subject: Your temporary verification code\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            "Your ChatGPT verification code is 482731.\r\n"
+        )
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "results": [
+                            {
+                                "id": 1817,
+                                "message_id": "message-id",
+                                "source": "sender@example.test",
+                                "address": "user@example.test",
+                                "raw": raw_mime,
+                                "metadata": None,
+                                "created_at": "2026-07-18 16:48:17",
+                            }
+                        ],
+                        "count": 1,
+                    },
+                )
+            ]
+        )
+        provider = self.provider(session)
+        mailbox = {"address": "user@example.test", "token": "mail-token"}
+
+        self.assertEqual(provider.wait_for_code(mailbox), "482731")
+        self.assertEqual(provider._last_response_shape, "results:list")
+        self.assertEqual(provider._last_raw_batch, 1)
+        self.assertEqual(provider._last_matched_batch, 1)
+
+    def test_nested_message_list_is_supported(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    200,
+                    {
+                        "data": {
+                            "messages": [
+                                {
+                                    "id": "otp",
+                                    "address": "user@example.test",
+                                    "subject": "Verification code: 739152",
+                                }
+                            ]
+                        }
+                    },
+                )
+            ]
+        )
+        provider = self.provider(session)
+
+        code = provider.wait_for_code({"address": "user@example.test", "token": "mail-token"})
+
+        self.assertEqual(code, "739152")
+        self.assertEqual(provider._last_response_shape, "data.messages:list")
+
+    def test_empty_inbox_diagnostic_distinguishes_delivery_from_recognition(self):
+        session = FakeSession([FakeResponse(200, {"results": [], "count": 0})])
+        provider = self.provider(session)
+        mailbox = {"address": "user@example.test", "token": "mail-token"}
+        logs: list[str] = []
+        mail_provider.provider_log_sink = logs.append
+        try:
+            with (
+                mock.patch.object(mail_provider.time, "sleep", return_value=None),
+                mock.patch.object(mail_provider.time, "monotonic", side_effect=[0.0, 0.0, 31.0]),
+            ):
+                self.assertIsNone(provider.wait_for_code(mailbox))
+        finally:
+            mail_provider.provider_log_sink = None
+
+        summary = "\n".join(logs)
+        self.assertIn("response_shape=results:list", summary)
+        self.assertIn("last_raw_batch=0", summary)
+        self.assertIn("last_matched_batch=0", summary)
+        self.assertIn("conclusion=upstream_delivery_not_observed", summary)
+        self.assertNotIn("mail-token", summary)
+
     def test_account_creation_failed_does_not_add_provider_cooldown_state(self):
         session = FakeSession([FakeResponse(200, {"address": "user@example.test", "jwt": "mail-token"})])
         provider = self.provider(session)

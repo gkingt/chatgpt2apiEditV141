@@ -520,10 +520,16 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
+        self._last_status_code: int | None = None
+        self._last_raw_batch = 0
+        self._last_matched_batch = 0
+        self._last_response_shape = "unknown"
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
+        self._last_status_code = None
         resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        self._last_status_code = int(resp.status_code)
         if resp.status_code not in expected:
             raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
@@ -576,8 +582,31 @@ class CloudflareTempMailProvider(BaseMailProvider):
     def fetch_recent_messages(self, mailbox: dict[str, Any]) -> list[dict[str, Any]]:
         headers = {"Authorization": f"Bearer {mailbox['token']}"}
         data = self._request("GET", "/api/mails", headers=headers, params={"limit": 20, "offset": 0})
-        raw = list(data.get("results") or []) if isinstance(data, dict) else data if isinstance(data, list) else []
+        raw: list[Any] = []
+        response_shape = type(data).__name__
+        if isinstance(data, list):
+            raw = data
+            response_shape = "root:list"
+        elif isinstance(data, dict):
+            for key in ("results", "emails", "messages", "data"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    raw = value
+                    response_shape = f"{key}:list"
+                    break
+                if isinstance(value, dict):
+                    for nested_key in ("results", "emails", "messages", "items"):
+                        nested = value.get(nested_key)
+                        if isinstance(nested, list):
+                            raw = nested
+                            response_shape = f"{key}.{nested_key}:list"
+                            break
+                    if raw:
+                        break
+        self._last_response_shape = response_shape
+        self._last_raw_batch = len(raw)
         summaries = [item for item in raw if isinstance(item, dict) and _message_matches_email(item, str(mailbox.get("address") or ""))]
+        self._last_matched_batch = len(summaries)
         return [self._normalize_message(mailbox, summary) for summary in summaries]
 
     def fetch_latest_message(self, mailbox: dict[str, Any]) -> dict[str, Any] | None:
@@ -596,11 +625,66 @@ class CloudflareTempMailProvider(BaseMailProvider):
             mailbox["_seen_code_message_refs"] = seen_value
         seen_refs = {str(item) for item in seen_value}
         deadline = time.monotonic() + self.conf["wait_timeout"]
-        scanned = boundary_filtered = no_code = last_batch = 0
+        successful_queries = empty_inboxes = http_429 = http_5xx = other_errors = 0
+        scanned = boundary_filtered = no_code = 0
+        raw_messages_seen = matched_messages_seen = 0
+        last_raw_batch = last_matched_batch = 0
+        last_status: int | None = None
+
+        def log_diagnostics(outcome: str) -> None:
+            domain = str(mailbox.get("address") or "").partition("@")[2] or "unknown"
+            if successful_queries and empty_inboxes == successful_queries and not raw_messages_seen:
+                conclusion = "upstream_delivery_not_observed"
+            elif raw_messages_seen and not matched_messages_seen:
+                conclusion = "recipient_not_matched"
+            elif matched_messages_seen and scanned and no_code:
+                conclusion = "mail_present_but_code_not_recognized"
+            elif matched_messages_seen and not scanned:
+                conclusion = "mail_present_but_already_seen_or_filtered"
+            elif http_429 or http_5xx or other_errors:
+                conclusion = "provider_query_errors"
+            else:
+                conclusion = "code_recognized" if outcome == "命中" else "inconclusive"
+            _provider_log(
+                f"CloudflareTempMail 验证码轮询{outcome}: "
+                f"provider_ref={self.provider_ref or self.name}, domain={domain}, "
+                f"successful_queries={successful_queries}, empty_inboxes={empty_inboxes}, "
+                f"http_429={http_429}, http_5xx={http_5xx}, other_errors={other_errors}, "
+                f"last_status={last_status if last_status is not None else 'none'}, "
+                f"response_shape={self._last_response_shape}, last_raw_batch={last_raw_batch}, "
+                f"last_matched_batch={last_matched_batch}, raw_messages_seen={raw_messages_seen}, "
+                f"matched_messages_seen={matched_messages_seen}, scanned={scanned}, no_code={no_code}, "
+                f"boundary_filtered={boundary_filtered}, conclusion={conclusion}"
+            )
 
         while time.monotonic() < deadline and not self._stopped():
-            messages = self.fetch_recent_messages(mailbox)
-            last_batch = len(messages)
+            try:
+                messages = self.fetch_recent_messages(mailbox)
+                last_status = self._last_status_code
+                successful_queries += 1
+            except RuntimeError:
+                last_status = self._last_status_code
+                if last_status == 429:
+                    http_429 += 1
+                    log_diagnostics("HTTP 429")
+                    raise
+                if last_status is not None and 500 <= last_status < 600:
+                    http_5xx += 1
+                else:
+                    other_errors += 1
+                    if last_status is not None and 400 <= last_status < 500:
+                        log_diagnostics("查询失败")
+                        raise
+                if self._poll_wait():
+                    break
+                continue
+
+            last_raw_batch = self._last_raw_batch
+            last_matched_batch = self._last_matched_batch
+            raw_messages_seen += last_raw_batch
+            matched_messages_seen += last_matched_batch
+            if not last_raw_batch:
+                empty_inboxes += 1
             for message in messages:
                 if _message_before_code_boundary(mailbox, message) and not message.get("message_id"):
                     boundary_filtered += 1
@@ -617,18 +701,13 @@ class CloudflareTempMailProvider(BaseMailProvider):
                 if code:
                     seen_value.append(ref)
                     seen_refs.add(ref)
+                    log_diagnostics("命中")
                     return code
                 no_code += 1
             if self._poll_wait():
                 break
 
-        domain = str(mailbox.get("address") or "").partition("@")[2]
-        _provider_log(
-            "CloudflareTempMail 验证码轮询超时: "
-            f"provider_ref={self.provider_ref or self.name}, domain={domain or 'unknown'}, "
-            f"wait_seconds={self.conf['wait_timeout']:.0f}, last_batch={last_batch}, scanned={scanned}, "
-            f"no_code={no_code}, boundary_filtered={boundary_filtered}, list_only=true"
-        )
+        log_diagnostics("超时")
         return None
 
     def close(self) -> None:
