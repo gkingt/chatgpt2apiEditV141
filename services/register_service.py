@@ -118,6 +118,10 @@ def _normalize(raw: dict) -> dict:
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
+    if not cfg["enabled"]:
+        stats["running"] = 0
+        stats["retry_at"] = None
+        stats["pause_reason"] = ""
     cfg["stats"] = stats
     return cfg
 

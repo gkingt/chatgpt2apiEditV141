@@ -43,6 +43,22 @@ class RegisterConcurrencyTests(unittest.TestCase):
         self.assertNotIn("domain_cooldown_threshold", provider)
         self.assertNotIn("domain_cooldown_seconds", provider)
 
+    def test_normalize_clears_stale_runtime_state_when_disabled(self) -> None:
+        config = register_service_module._normalize(
+            {
+                "enabled": False,
+                "stats": {
+                    "running": 2,
+                    "retry_at": "2099-01-01T00:00:00+00:00",
+                    "pause_reason": "account_creation_risk",
+                },
+            }
+        )
+
+        self.assertEqual(config["stats"]["running"], 0)
+        self.assertIsNone(config["stats"]["retry_at"])
+        self.assertEqual(config["stats"]["pause_reason"], "")
+
     def test_start_applies_three_threads_atomically_and_runs_in_parallel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
