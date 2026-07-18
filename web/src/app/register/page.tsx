@@ -1,17 +1,17 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LoaderCircle } from "lucide-react";
 
 import webConfig from "@/constants/common-env";
 import { useAuthGuard } from "@/lib/use-auth-guard";
-import type { RegisterConfig } from "@/lib/api";
+import { fetchNewRegisterConfig, type RegisterConfig } from "@/lib/api";
 import { getStoredAuthKey } from "@/store/auth";
 
 import { useSettingsStore } from "../settings/store";
 import { RegisterCard } from "./components/register-card";
 
-function RegisterDataController() {
+function RegisterDataController({ onNewRegister }: { onNewRegister: (config: RegisterConfig) => void }) {
   const didLoadRef = useRef(false);
   const loadRegister = useSettingsStore((state) => state.loadRegister);
   const setRegisterConfig = useSettingsStore((state) => state.setRegisterConfig);
@@ -39,13 +39,35 @@ function RegisterDataController() {
     };
   }, [setRegisterConfig]);
 
+  useEffect(() => {
+    void fetchNewRegisterConfig().then((data) => onNewRegister(data.register));
+  }, [onNewRegister]);
+
+  useEffect(() => {
+    let source: EventSource | null = null;
+    let closed = false;
+    void getStoredAuthKey().then((token) => {
+      if (closed || !token) return;
+      const baseUrl = webConfig.apiUrl.replace(/\/$/, "");
+      source = new EventSource(`${baseUrl}/api/register/new/events?token=${encodeURIComponent(token)}`);
+      source.onmessage = (event) => {
+        onNewRegister(JSON.parse(event.data) as RegisterConfig);
+      };
+    });
+    return () => {
+      closed = true;
+      source?.close();
+    };
+  }, [onNewRegister]);
+
   return null;
 }
 
 function RegisterPageContent() {
+  const [newRegister, setNewRegister] = useState<RegisterConfig | null>(null);
   return (
     <>
-      <RegisterDataController />
+      <RegisterDataController onNewRegister={setNewRegister} />
       <section className="mb-2 flex flex-col gap-1 lg:flex-row lg:items-start lg:justify-between">
         <div className="space-y-1">
           <div className="text-xs font-semibold tracking-[0.18em] text-stone-500 uppercase">Register</div>
@@ -53,7 +75,7 @@ function RegisterPageContent() {
         </div>
       </section>
       <section>
-        <RegisterCard />
+        <RegisterCard newRegister={newRegister} onNewRegisterChange={setNewRegister} />
       </section>
     </>
   );

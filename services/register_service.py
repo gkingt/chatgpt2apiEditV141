@@ -10,10 +10,11 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR
-from services.register import mail_provider, openai_register
+from services.register import mail_provider, openai_register, reference_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+NEW_REGISTER_FILE = DATA_DIR / "new_register.json"
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
     return "\n".join(
@@ -123,14 +124,15 @@ def _normalize(raw: dict) -> dict:
 
 
 class RegisterService:
-    def __init__(self, store_file: Path):
+    def __init__(self, store_file: Path, engine=openai_register):
         self._store_file = store_file
+        self._engine = engine
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._generation = 0
         self._stop_event = threading.Event()
         self._logs: list[dict] = []
-        openai_register.register_log_sink = self._append_log
+        self._engine.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
             self.start()
@@ -151,6 +153,27 @@ class RegisterService:
         self._redact_outlook_pools(snapshot)
         self._attach_tempmail_domain_stats(snapshot)
         return snapshot
+
+    def shared_config_snapshot(self) -> dict:
+        with self._lock:
+            return json.loads(
+                json.dumps(
+                    {
+                        key: self._config[key]
+                        for key in (
+                            "mail",
+                            "proxy",
+                            "total",
+                            "threads",
+                            "mode",
+                            "target_quota",
+                            "target_available",
+                            "check_interval",
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+            )
 
     @staticmethod
     def _attach_tempmail_domain_stats(snapshot: dict) -> None:
@@ -242,7 +265,7 @@ class RegisterService:
         self._apply_runtime_config_locked()
 
     def _apply_runtime_config_locked(self) -> None:
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+        self._engine.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
 
     def update(self, updates: dict) -> dict:
         with self._lock:
@@ -292,8 +315,8 @@ class RegisterService:
                 "started_at": _now(),
                 "updated_at": _now(),
             }
-            with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
+            with self._engine.stats_lock:
+                self._engine.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
             self._runner = threading.Thread(
                 target=self._run,
@@ -336,8 +359,8 @@ class RegisterService:
                 **self._pool_metrics(),
                 "updated_at": _now(),
             }
-            with openai_register.stats_lock:
-                openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
+            with self._engine.stats_lock:
+                self._engine.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
             return self.get()
 
@@ -346,7 +369,7 @@ class RegisterService:
         if scope == "unused":
             with self._lock:
                 removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+                self._engine.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
                 self._save()
                 self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
             return self.get()
@@ -452,7 +475,7 @@ class RegisterService:
                     and not self._target_reached(cfg, success, len(futures), generation, stop_event)
                 ):
                     task_index += 1
-                    futures.add(executor.submit(openai_register.worker, task_index, stop_event, generation))
+                    futures.add(executor.submit(self._engine.worker, task_index, stop_event, generation))
                 self._bump_generation(
                     generation,
                     stop_event,
@@ -560,3 +583,4 @@ class RegisterService:
 
 
 register_service = RegisterService(REGISTER_FILE)
+new_register_service = RegisterService(NEW_REGISTER_FILE, engine=reference_register)

@@ -970,6 +970,22 @@ export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all
   });
 }
 
+export async function fetchNewRegisterConfig() {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/new");
+}
+
+export async function startNewRegister() {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/new/start", { method: "POST" });
+}
+
+export async function stopNewRegister() {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/new/stop", { method: "POST" });
+}
+
+export async function resetNewRegister() {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/new/reset", { method: "POST" });
+}
+
 // ── CPA (CLIProxyAPI) ──────────────────────────────────────────────
 
 export type CPAPool = {

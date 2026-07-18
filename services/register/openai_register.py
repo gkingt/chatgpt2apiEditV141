@@ -8,6 +8,7 @@ import string
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,7 @@ print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
+_thread_log_context = threading.local()
 
 
 class RegistrationStopped(RuntimeError):
@@ -120,9 +122,10 @@ navigate_headers = {
 
 def log(text: str, color: str = "") -> None:
     colors = {"red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
-    if register_log_sink:
+    sink = getattr(_thread_log_context, "sink", None) or register_log_sink
+    if sink:
         try:
-            register_log_sink(text, color)
+            sink(text, color)
         except Exception:
             pass
     with print_lock:
@@ -133,6 +136,22 @@ def log(text: str, color: str = "") -> None:
 
 def step(index: int, text: str, color: str = "") -> None:
     log(f"[任务{index}] {text}", color)
+
+
+@contextmanager
+def thread_log_sink(sink):
+    previous = getattr(_thread_log_context, "sink", None)
+    _thread_log_context.sink = sink
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_thread_log_context, "sink")
+            except AttributeError:
+                pass
+        else:
+            _thread_log_context.sink = previous
 
 
 mail_provider.provider_log_sink = lambda text: log(text, "yellow")
@@ -273,14 +292,21 @@ def wait_for_code(
     return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox, stop_event=stop_event)
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
+def build_sentinel_token(
+    session: requests.Session,
+    device_id: str,
+    flow: str,
+    *,
+    user_agent_override: str = "",
+    sec_ch_ua_override: str = "",
+) -> str:
     """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
     sentinel_val, oai_sc_value = _build_sentinel_token_tuple(
         session,
         device_id,
         flow,
-        user_agent=user_agent,
-        sec_ch_ua=sec_ch_ua,
+        user_agent=user_agent_override or user_agent,
+        sec_ch_ua=sec_ch_ua_override or sec_ch_ua,
     )
     if oai_sc_value:
         for domain in (".auth.openai.com", "auth.openai.com"):
@@ -291,13 +317,20 @@ def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -
     return sentinel_val
 
 
-def build_sentinel_headers_with_sdk(session: requests.Session, device_id: str, flow: str):
+def build_sentinel_headers_with_sdk(
+    session: requests.Session,
+    device_id: str,
+    flow: str,
+    *,
+    user_agent_override: str = "",
+    sec_ch_ua_override: str = "",
+):
     return _build_sentinel_headers_with_sdk(
         session,
         device_id,
         flow,
-        user_agent=user_agent,
-        sec_ch_ua=sec_ch_ua,
+        user_agent=user_agent_override or user_agent,
+        sec_ch_ua=sec_ch_ua_override or sec_ch_ua,
         observer_wait_ms=5000,
     )
 
@@ -475,6 +508,30 @@ class PlatformRegistrar:
         if self.stop_event is not None and self.stop_event.is_set():
             raise RegistrationStopped("registration_run_stopped")
 
+    def _browser_user_agent(self) -> str:
+        return user_agent
+
+    def _browser_sec_ch_ua(self) -> str:
+        return sec_ch_ua
+
+    def _build_sentinel_token(self, flow: str) -> str:
+        return build_sentinel_token(
+            self.session,
+            self.device_id,
+            flow,
+            user_agent_override=self._browser_user_agent(),
+            sec_ch_ua_override=self._browser_sec_ch_ua(),
+        )
+
+    def _build_sentinel_headers(self, flow: str):
+        return build_sentinel_headers_with_sdk(
+            self.session,
+            self.device_id,
+            flow,
+            user_agent_override=self._browser_user_agent(),
+            sec_ch_ua_override=self._browser_sec_ch_ua(),
+        )
+
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
         if referer:
@@ -510,7 +567,7 @@ class PlatformRegistrar:
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "user-agent": user_agent,
+            "user-agent": self._browser_user_agent(),
         }
         headers.update(_make_trace_headers())
         return headers
@@ -570,7 +627,7 @@ class PlatformRegistrar:
         self.device_id = str(cookies.get("oai-did") or self.device_id)
         step(index, "ChatGPT 会话初始化完成")
 
-    def _chatgpt_authorize(self, email: str, index: int) -> None:
+    def _chatgpt_authorize(self, email: str, index: int, *, include_login_hint: bool = False) -> None:
         self._boot_chatgpt_session(index)
         csrf_url = f"{chatgpt_base}/api/auth/csrf"
         csrf_browser_headers = {
@@ -579,7 +636,7 @@ class PlatformRegistrar:
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "user-agent": user_agent,
+            "user-agent": self._browser_user_agent(),
         }
         csrf_headers = _headers_with_clearance(
             csrf_browser_headers,
@@ -599,13 +656,16 @@ class PlatformRegistrar:
         if csrf_resp is None or csrf_resp.status_code != 200 or not csrf_token:
             raise RuntimeError(error or f"chatgpt_csrf_http_{getattr(csrf_resp, 'status_code', 'unknown')}")
 
-        query = urlencode({
+        query_params = {
             "prompt": "login",
             "ext-oai-did": self.device_id,
             "auth_session_logging_id": str(uuid.uuid4()),
             "ext-passkey-client-capabilities": "0111",
             "screen_hint": "login_or_signup",
-        })
+        }
+        if include_login_hint:
+            query_params["login_hint"] = email
+        query = urlencode(query_params)
         signin_url = f"{chatgpt_base}/api/auth/signin/openai?{query}"
         signin_headers = {
             "accept": "*/*",
@@ -616,7 +676,7 @@ class PlatformRegistrar:
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "user-agent": user_agent,
+            "user-agent": self._browser_user_agent(),
         }
         signin_headers = _headers_with_clearance(signin_headers, signin_url, self.proxy, self.clearance_user_agent)
         signin_resp, error = request_with_local_retry(
@@ -772,7 +832,7 @@ class PlatformRegistrar:
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "user-agent": user_agent,
+            "user-agent": self._browser_user_agent(),
         }
         session_headers = _headers_with_clearance(session_headers, session_url, self.proxy, self.clearance_user_agent)
         session_resp, error = request_with_local_retry(
@@ -817,13 +877,13 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"authorize_continue_http_{getattr(resp, 'status_code', 'unknown')}, {debug}")
         step(index, f"authorize continue 完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
 
-    def _authorize_signup(self, email: str, index: int) -> tuple[str, str]:
+    def _authorize_signup(self, email: str, index: int, *, screen_hint: str = "signup") -> tuple[str, str]:
         self._ensure_active()
         step(index, "提交 ChatGPT 注册邮箱")
         url = f"{auth_base}/api/accounts/authorize/continue"
 
         def submit():
-            sentinel_token = build_sentinel_token(self.session, self.device_id, "authorize_continue")
+            sentinel_token = self._build_sentinel_token("authorize_continue")
             self.authorize_sentinel_token = sentinel_token
             headers = self._json_headers(f"{auth_base}/create-account")
             headers["openai-sentinel-token"] = sentinel_token
@@ -832,7 +892,7 @@ class PlatformRegistrar:
                 self.session,
                 "post",
                 url,
-                json={"username": {"value": email, "kind": "email"}, "screen_hint": "signup"},
+                json={"username": {"value": email, "kind": "email"}, "screen_hint": screen_hint},
                 headers=headers,
                 allow_redirects=False,
                 verify=False,
@@ -893,11 +953,7 @@ class PlatformRegistrar:
         step(index, "开始提交注册密码")
         url = f"{auth_base}/api/accounts/user/register"
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        self.password_sentinel_token = build_sentinel_token(
-            self.session,
-            self.device_id,
-            "username_password_create",
-        )
+        self.password_sentinel_token = self._build_sentinel_token("username_password_create")
         headers["openai-sentinel-token"] = self.password_sentinel_token
         headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
         resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False)
@@ -906,11 +962,7 @@ class PlatformRegistrar:
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/create-account/password")
-            self.password_sentinel_token = build_sentinel_token(
-                self.session,
-                self.device_id,
-                "username_password_create",
-            )
+            self.password_sentinel_token = self._build_sentinel_token("username_password_create")
             headers["openai-sentinel-token"] = self.password_sentinel_token
             headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "post", url, json={"username": email, "password": password}, headers=headers, verify=False)
@@ -1082,7 +1134,7 @@ class PlatformRegistrar:
         step(index, "开始创建账号资料")
         url = f"{auth_base}/api/accounts/create_account"
         headers = self._json_headers(f"{auth_base}/about-you")
-        sentinel_headers = build_sentinel_headers_with_sdk(self.session, self.device_id, "oauth_create_account")
+        sentinel_headers = self._build_sentinel_headers("oauth_create_account")
         if not sentinel_headers.so_token:
             raise RuntimeError(f"create_account_missing_sentinel_so_token: {sentinel_headers.log_summary()}")
         headers.update(sentinel_headers.as_headers())
@@ -1094,7 +1146,7 @@ class PlatformRegistrar:
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
             headers = self._json_headers(f"{auth_base}/about-you")
-            sentinel_headers = build_sentinel_headers_with_sdk(self.session, self.device_id, "oauth_create_account")
+            sentinel_headers = self._build_sentinel_headers("oauth_create_account")
             if not sentinel_headers.so_token:
                 raise RuntimeError(f"create_account_missing_sentinel_so_token: {sentinel_headers.log_summary()}")
             headers.update(sentinel_headers.as_headers())

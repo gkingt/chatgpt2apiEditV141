@@ -1,7 +1,8 @@
 "use client";
 
-import { Activity, AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Settings2, Square, Trash2, UserPlus } from "lucide-react";
+import { Activity, AlertTriangle, LoaderCircle, Plus, Play, RotateCcw, Save, Settings2, Square, Trash2, UserPlus, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -9,12 +10,20 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { resetNewRegister, startNewRegister, stopNewRegister, type RegisterConfig } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 import { useSettingsStore } from "../../settings/store";
 
-export function RegisterCard() {
-  const [mobileView, setMobileView] = useState<"config" | "results">("config");
+type RegisterCardProps = {
+  newRegister: RegisterConfig | null;
+  onNewRegisterChange: (config: RegisterConfig) => void;
+};
+
+export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardProps) {
+  const [mobileView, setMobileView] = useState<"config" | "results" | "new">("config");
+  const [desktopResultView, setDesktopResultView] = useState<"results" | "new">("results");
+  const [isSavingNew, setIsSavingNew] = useState(false);
   const selectedInitialMobileView = useRef(false);
   const config = useSettingsStore((state) => state.registerConfig);
   const isLoading = useSettingsStore((state) => state.isLoadingRegister);
@@ -37,10 +46,15 @@ export function RegisterCard() {
   const resetOutlookPool = useSettingsStore((state) => state.resetOutlookPool);
 
   useEffect(() => {
-    if (!config || selectedInitialMobileView.current) return;
+    if (!config || !newRegister || selectedInitialMobileView.current) return;
     selectedInitialMobileView.current = true;
-    setMobileView(config.enabled ? "results" : "config");
-  }, [config]);
+    if (newRegister.enabled) {
+      setMobileView("new");
+      setDesktopResultView("new");
+    } else {
+      setMobileView(config.enabled ? "results" : "config");
+    }
+  }, [config, newRegister]);
 
   if (isLoading) {
     return (
@@ -55,6 +69,33 @@ export function RegisterCard() {
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
+  const newStats = newRegister?.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
+  const newLogs = newRegister?.logs || [];
+  const toggleNewRegister = async () => {
+    if (!newRegister) return;
+    setIsSavingNew(true);
+    try {
+      const data = newRegister.enabled ? await stopNewRegister() : await startNewRegister();
+      onNewRegisterChange(data.register);
+      toast.success(newRegister.enabled ? "新注册任务已停止" : "新注册任务已启动");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "切换新注册状态失败");
+    } finally {
+      setIsSavingNew(false);
+    }
+  };
+  const resetNewRegisterStats = async () => {
+    setIsSavingNew(true);
+    try {
+      const data = await resetNewRegister();
+      onNewRegisterChange(data.register);
+      toast.success("新注册统计已重置");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "重置新注册统计失败");
+    } finally {
+      setIsSavingNew(false);
+    }
+  };
   const updateProviderType = (index: number, type: string) => {
     updateProvider(index, {
       type,
@@ -409,8 +450,9 @@ export function RegisterCard() {
         role="tabpanel"
         aria-label="运行结果"
         className={cn(
-          "min-h-0 flex-col p-4 pb-24 xl:flex xl:pb-4",
+          "min-h-0 flex-col p-4 pb-24 xl:pb-4",
           mobileView === "results" ? "flex" : "hidden",
+          desktopResultView === "results" ? "xl:flex" : "xl:hidden",
         )}
       >
         <div className="space-y-3">
@@ -419,9 +461,15 @@ export function RegisterCard() {
                 <h2 className="text-lg font-semibold tracking-tight">运行结果</h2>
                 <p className="mt-1 text-sm text-stone-500">SSE 实时推送当前状态。</p>
               </div>
-              <Badge variant={config.enabled ? "success" : "secondary"} className="rounded-md">
-                {config.enabled ? "运行中" : "已停止"}
-              </Badge>
+              <div className="flex items-center gap-2">
+                <div className="hidden items-center rounded-lg border border-stone-200 bg-white p-1 xl:flex">
+                  <button type="button" onClick={() => setDesktopResultView("results")} className="rounded-md bg-stone-950 px-2.5 py-1.5 text-xs font-semibold text-white">运行结果</button>
+                  <button type="button" onClick={() => setDesktopResultView("new")} className="rounded-md px-2.5 py-1.5 text-xs font-semibold text-stone-500 hover:bg-stone-100">新注册</button>
+                </div>
+                <Badge variant={config.enabled ? "success" : "secondary"} className="rounded-md">
+                  {config.enabled ? "运行中" : "已停止"}
+                </Badge>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {[
@@ -443,7 +491,7 @@ export function RegisterCard() {
               ))}
             </div>
             <div className="grid grid-cols-3 gap-2">
-              <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving}>
+              <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving || (!config.enabled && Boolean(newRegister?.enabled))}>
                 {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : config.enabled ? <Square className="size-4" /> : <Play className="size-4" />}
                 {config.enabled ? "停止" : "启动"}
               </Button>
@@ -484,6 +532,95 @@ export function RegisterCard() {
                 ))
               )}
             </div>
+        </div>
+      </section>
+
+      <section
+        id="register-new-panel"
+        role="tabpanel"
+        aria-label="新注册"
+        className={cn(
+          "min-h-0 flex-col p-4 pb-24 xl:pb-4",
+          mobileView === "new" ? "flex" : "hidden",
+          desktopResultView === "new" ? "xl:flex" : "xl:hidden",
+        )}
+      >
+        <div className="space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex size-9 items-center justify-center rounded-md bg-amber-100">
+                <Zap className="size-5 text-amber-700" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold tracking-tight">新注册</h2>
+                <p className="mt-1 text-sm text-stone-500">独立运行参考项目流程，共用左侧邮箱、代理和任务参数。</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="hidden items-center rounded-lg border border-stone-200 bg-white p-1 xl:flex">
+                <button type="button" onClick={() => setDesktopResultView("results")} className="rounded-md px-2.5 py-1.5 text-xs font-semibold text-stone-500 hover:bg-stone-100">运行结果</button>
+                <button type="button" onClick={() => setDesktopResultView("new")} className="rounded-md bg-stone-950 px-2.5 py-1.5 text-xs font-semibold text-white">新注册</button>
+              </div>
+              <Badge variant={newRegister?.enabled ? "success" : "secondary"} className="rounded-md">
+                {newRegister?.enabled ? "运行中" : "已停止"}
+              </Badge>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+            新流程使用随机桌面/移动设备画像和带 login_hint 的 URL 驱动注册；邮箱读取、Sentinel/SO Token、账号入池继续使用本项目现有实现。
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {[
+              ["成功 / 成功率", `${newStats.success} / ${newStats.success_rate || 0}%`],
+              ["失败", newStats.fail],
+              ["完成", newStats.done],
+              ["运行 / 线程", `${newStats.running} / ${newStats.threads}`],
+              ["运行时间", `${newStats.elapsed_seconds || 0}s`],
+              ["平均注册单个", `${newStats.avg_seconds || 0}s`],
+              ["连续失败", newStats.consecutive_failures || 0],
+              ["调度自恢复", newStats.scheduler_restarts || 0],
+            ].map(([label, value]) => (
+              <div key={label} className="border border-stone-200 bg-white/70 px-3 py-2">
+                <div className="text-xs text-stone-400">{label}</div>
+                <div className="mt-1 text-base font-semibold text-stone-800">{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <Button className="h-10 rounded-xl bg-amber-500 px-3 font-semibold text-stone-950 hover:bg-amber-400" onClick={() => void toggleNewRegister()} disabled={isSavingNew || !newRegister || (!newRegister.enabled && config.enabled)}>
+              {isSavingNew ? <LoaderCircle className="size-4 animate-spin" /> : newRegister?.enabled ? <Square className="size-4" /> : <Play className="size-4" />}
+              {newRegister?.enabled ? "停止新注册" : "启动新注册"}
+            </Button>
+            <Button variant="outline" className="h-10 rounded-xl border-stone-200 bg-white px-3 text-stone-700" onClick={() => void resetNewRegisterStats()} disabled={isSavingNew || Boolean(newRegister?.enabled)}>
+              <RotateCcw className="size-4" />
+              重置统计
+            </Button>
+          </div>
+        </div>
+
+        <div className="mt-4 flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden border-t border-stone-200 pt-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-stone-900">新注册实时日志</h3>
+              <p className="mt-1 text-xs text-stone-500">与原注册模块独立运行、独立统计。</p>
+            </div>
+            <Badge variant="secondary" className="rounded-md">{newLogs.length}</Badge>
+          </div>
+          <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto border border-stone-200 bg-white/70 p-3 font-mono text-xs leading-6">
+            {newLogs.length === 0 ? (
+              <div className="text-stone-500">暂无新注册日志</div>
+            ) : (
+              newLogs.slice().reverse().map((item, index) => (
+                <div key={`${item.time}-${index}`} className={item.level === "red" ? "text-rose-600" : item.level === "green" ? "text-emerald-700" : item.level === "yellow" ? "text-amber-700" : "text-stone-700"}>
+                  <span className="text-stone-400">{new Date(item.time).toLocaleTimeString()}</span>
+                  <span className="break-words pl-2 [overflow-wrap:anywhere]">{item.text}</span>
+                </div>
+              ))
+            )}
+          </div>
         </div>
       </section>
     </div>
@@ -528,6 +665,28 @@ export function RegisterCard() {
         运行结果
         {stats.fail > 0 ? (
           <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] leading-none", mobileView === "results" ? "bg-white/15 text-white dark:bg-stone-900/15 dark:text-stone-900" : "bg-rose-50 text-rose-600")}>{stats.fail}</span>
+        ) : null}
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={mobileView === "new"}
+        aria-controls="register-new-panel"
+        onClick={() => setMobileView("new")}
+        className={cn(
+          "inline-flex h-10 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition",
+          mobileView === "new"
+            ? "bg-amber-500 text-stone-950 shadow-sm"
+            : "text-stone-500 hover:bg-stone-100 hover:text-stone-900 dark:text-stone-300 dark:hover:bg-white/10 dark:hover:text-white",
+        )}
+      >
+        <span className="relative">
+          <Zap className="size-4" />
+          {newRegister?.enabled ? <span className="absolute -right-1 -top-1 size-2 rounded-full border border-white bg-emerald-500" /> : null}
+        </span>
+        新注册
+        {(newStats.fail || 0) > 0 ? (
+          <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] leading-none", mobileView === "new" ? "bg-stone-950/10 text-stone-950" : "bg-rose-50 text-rose-600")}>{newStats.fail}</span>
         ) : null}
       </button>
     </div>
