@@ -82,11 +82,34 @@ class RegistrationOtpRetryTests(unittest.TestCase):
         with (
             mock.patch.object(openai_register, "wait_for_code", side_effect=[None, None, None, "222222"]) as wait,
             mock.patch.object(openai_register, "validate_otp", return_value=(accepted, "")) as validate,
+            mock.patch.object(registrar, "_resend_signup_otp") as resend,
         ):
             registrar._validate_mailbox_otp(mailbox, 1)
 
         registrar.close()
         self.assertEqual(wait.call_count, 4)
+        self.assertEqual(resend.call_count, 3)
+        self.assertEqual(resend.call_args_list, [mock.call(1, mailbox)] * 3)
+        validate.assert_called_once_with(registrar.session, registrar.device_id, "222222")
+
+    def test_mailbox_polling_continues_when_non_rate_limit_resend_fails(self) -> None:
+        registrar = openai_register.PlatformRegistrar("")
+        mailbox = {"address": "user@example.com"}
+        accepted = FakeResponse(200)
+
+        with (
+            mock.patch.object(openai_register, "wait_for_code", side_effect=[None, "222222"]),
+            mock.patch.object(openai_register, "validate_otp", return_value=(accepted, "")) as validate,
+            mock.patch.object(
+                registrar,
+                "_resend_signup_otp",
+                side_effect=RuntimeError("temporary resend failure"),
+            ) as resend,
+        ):
+            registrar._validate_mailbox_otp(mailbox, 1)
+
+        registrar.close()
+        resend.assert_called_once_with(1, mailbox)
         validate.assert_called_once_with(registrar.session, registrar.device_id, "222222")
 
     def test_validate_does_not_resubmit_same_known_wrong_code_with_sentinel(self) -> None:

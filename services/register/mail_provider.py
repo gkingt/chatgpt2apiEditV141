@@ -1274,17 +1274,29 @@ class TempMailLolProvider(BaseMailProvider):
         rejected_codes = 0
         key_switches = 0
         last_batch = 0
+        raw_messages_seen = 0
         last_status: int | None = None
 
         def log_diagnostics(outcome: str) -> None:
             domain = _tempmail_root_domain(str(mailbox.get("address") or "")) or "unknown"
+            if successful_queries and empty_inboxes == successful_queries and not raw_messages_seen:
+                conclusion = "upstream_delivery_not_observed"
+            elif raw_messages_seen and not scanned:
+                conclusion = "mail_present_but_already_seen_or_filtered"
+            elif scanned and no_code:
+                conclusion = "mail_present_but_code_not_recognized"
+            elif http_429 or http_5xx or other_errors:
+                conclusion = "provider_query_errors"
+            else:
+                conclusion = "code_recognized" if outcome == "命中" else "inconclusive"
             _provider_log(
                 f"TempMail.lol 验证码轮询{outcome}: domain={domain}, "
                 f"successful_queries={successful_queries}, empty_inboxes={empty_inboxes}, "
                 f"http_429={http_429}, http_5xx={http_5xx}, other_errors={other_errors}, "
                 f"last_status={last_status if last_status is not None else 'none'}, last_batch={last_batch}, "
+                f"raw_messages_seen={raw_messages_seen}, delivery_observed={str(bool(raw_messages_seen)).lower()}, "
                 f"scanned={scanned}, no_code={no_code}, rejected_codes={rejected_codes}, "
-                f"boundary_filtered={boundary_filtered}, key_switches={key_switches}"
+                f"boundary_filtered={boundary_filtered}, key_switches={key_switches}, conclusion={conclusion}"
             )
 
         while time.monotonic() < deadline and not self._stopped():
@@ -1326,6 +1338,7 @@ class TempMailLolProvider(BaseMailProvider):
 
             messages = [self._message_from_item(mailbox, item) for item in self._inbox_items(data)]
             last_batch = len(messages)
+            raw_messages_seen += last_batch
             if not messages:
                 empty_inboxes += 1
             messages.sort(

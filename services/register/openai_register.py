@@ -1025,6 +1025,19 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
         step(index, "验证码校验完成")
 
+    def _retry_signup_otp_delivery(self, mailbox: dict[str, Any], index: int, reason: str) -> None:
+        """Request a fresh OTP between polling windows without hiding hard rate limits."""
+        try:
+            self._resend_signup_otp(index, mailbox)
+            step(index, f"{reason}，已主动重发验证码")
+        except RegistrationStopped:
+            raise
+        except Exception as exc:
+            detail = str(exc)
+            if "429" in detail:
+                raise
+            step(index, f"{reason}，主动重发失败，继续等待现有邮件: {detail[:180]}", "yellow")
+
     def _validate_mailbox_otp(self, mailbox: dict[str, Any], index: int) -> None:
         max_attempts = 4
         last_detail = ""
@@ -1036,7 +1049,8 @@ class PlatformRegistrar:
             if not code:
                 if attempt >= max_attempts:
                     raise RuntimeError(last_detail or "等待注册验证码超时")
-                step(index, f"第 {attempt}/{max_attempts} 次等待未收到验证码，继续等待", "yellow")
+                step(index, f"第 {attempt}/{max_attempts} 次等待未观察到验证码邮件，准备主动重发", "yellow")
+                self._retry_signup_otp_delivery(mailbox, index, "本轮邮箱接口未观察到验证码")
                 continue
             mail_provider.mark_verification_code_received(mailbox)
             step(index, "收到注册验证码")
@@ -1058,7 +1072,8 @@ class PlatformRegistrar:
                 raise RuntimeError(last_detail)
 
             mail_provider.mark_verification_code_rejected(mailbox, code)
-            step(index, f"验证码被上游拒绝({error_code})，忽略该验证码并等待更新邮件", "yellow")
+            step(index, f"验证码被上游拒绝({error_code})，忽略该验证码并请求新邮件", "yellow")
+            self._retry_signup_otp_delivery(mailbox, index, "验证码已失效或不匹配")
             time.sleep(1.5)
 
         raise RuntimeError(last_detail or "验证码校验失败")

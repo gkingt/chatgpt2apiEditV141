@@ -357,6 +357,28 @@ class TempMailLolProviderTests(unittest.TestCase):
         self.assertNotIn("api-secret", summary)
         self.assertNotIn("token-secret", summary)
 
+    def test_empty_poll_diagnostic_identifies_unobserved_delivery(self) -> None:
+        entry = {"provider_ref": "tempmail-empty", "api_key": "api-secret", "domain": []}
+        session = FakeSession([FakeResponse(200, {"emails": []})])
+        provider = self.make_provider(entry, session)
+        mailbox = {"address": "mail@mx.example.com", "token": "token-secret"}
+        logs: list[str] = []
+        mail_provider.provider_log_sink = logs.append
+        try:
+            with (
+                mock.patch.object(mail_provider.time, "sleep", return_value=None),
+                mock.patch.object(mail_provider.time, "monotonic", side_effect=[0.0, 0.0, 3.0]),
+            ):
+                self.assertIsNone(provider.wait_for_code(mailbox))
+        finally:
+            mail_provider.provider_log_sink = None
+
+        summary = "\n".join(logs)
+        self.assertIn("delivery_observed=false", summary)
+        self.assertIn("conclusion=upstream_delivery_not_observed", summary)
+        self.assertNotIn("api-secret", summary)
+        self.assertNotIn("token-secret", summary)
+
     def test_domain_history_never_skips_created_address(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
             mail_provider, "TEMPMAIL_DOMAIN_STATS_FILE", Path(temp_dir) / "domain-stats.json"
