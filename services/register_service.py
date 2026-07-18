@@ -16,6 +16,17 @@ from services.register import mail_provider, openai_register
 REGISTER_FILE = DATA_DIR / "register.json"
 
 
+def _immediate_backoff_reason(error: object) -> str:
+    text = str(error or "").lower()
+    if "account_creation_failed" in text or "registration_disallowed" in text:
+        return "account_creation_risk"
+    if "http 429" in text or "http_429" in text or "rate limit" in text:
+        return "rate_limit"
+    if "getaddrinfo() thread failed to start" in text or "could not resolve host" in text:
+        return "network_resolution"
+    return ""
+
+
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
     return "\n".join(
         f'{c["email"]}----{c.get("password", "")}----{c["client_id"]}----{c["refresh_token"]}' for c in credentials
@@ -405,6 +416,7 @@ class RegisterService:
         success = int(initial_stats.get("success") or 0)
         fail = int(initial_stats.get("fail") or 0)
         consecutive_failures = int(initial_stats.get("consecutive_failures") or 0)
+        immediate_pause_reason = ""
         task_index = done
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
@@ -433,13 +445,20 @@ class RegisterService:
                         break
                     if consecutive_failures >= threshold:
                         delay = max(1, int(cfg.get("failure_backoff_seconds") or 1200))
-                        self._append_log(
-                            f"连续失败 {consecutive_failures} 次，暂停新注册 {delay} 秒；无需人工干预，冷却后自动恢复",
-                            "yellow",
-                        )
-                        if not self._wait_for_retry(delay, "consecutive_failures"):
+                        if immediate_pause_reason:
+                            self._append_log(
+                                f"检测到全局风控/限流/解析故障，按 429 处理并暂停新注册 {delay} 秒；冷却后自动恢复",
+                                "yellow",
+                            )
+                        else:
+                            self._append_log(
+                                f"连续失败 {consecutive_failures} 次，暂停新注册 {delay} 秒；无需人工干预，冷却后自动恢复",
+                                "yellow",
+                            )
+                        if not self._wait_for_retry(delay, immediate_pause_reason or "consecutive_failures"):
                             break
                         consecutive_failures = 0
+                        immediate_pause_reason = ""
                         continue
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
@@ -449,8 +468,10 @@ class RegisterService:
                     try:
                         result = future.result()
                         ok = bool(isinstance(result, dict) and result.get("ok"))
+                        failure_error = str(result.get("error") or "") if isinstance(result, dict) else ""
                     except Exception as error:
                         ok = False
+                        failure_error = str(error)
                         self._append_log(
                             f"注册工作线程异常（{type(error).__name__}），已计为失败并继续调度",
                             "red",
@@ -458,9 +479,14 @@ class RegisterService:
                     if ok:
                         success += 1
                         consecutive_failures = 0
+                        immediate_pause_reason = ""
                     else:
                         fail += 1
                         consecutive_failures += 1
+                        reason = _immediate_backoff_reason(failure_error)
+                        if reason:
+                            immediate_pause_reason = reason
+                            consecutive_failures = max(consecutive_failures, threshold)
                 self._bump(
                     running=len(futures),
                     done=done,

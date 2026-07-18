@@ -57,6 +57,13 @@ export function RegisterCard() {
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
   const retryAt = stats.retry_at ? new Date(stats.retry_at) : null;
   const isCooling = Boolean(config.enabled && retryAt && retryAt.getTime() > Date.now());
+  const coolingReason = stats.pause_reason === "account_creation_risk"
+    ? "账号创建风控"
+    : stats.pause_reason === "rate_limit"
+      ? "接口限流"
+      : stats.pause_reason === "network_resolution"
+        ? "网络解析故障"
+        : "连续失败";
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
   const updateProviderType = (index: number, type: string) => {
@@ -156,7 +163,7 @@ export function RegisterCard() {
             </div>
           </div>
 
-          <p className="text-xs leading-5 text-stone-500">默认连续失败 3 次后暂停 1200 秒（20 分钟），冷却期间任务保持启用并自动恢复；单次失败不会停止注册。</p>
+          <p className="text-xs leading-5 text-stone-500">默认连续失败 3 次后暂停 1200 秒（20 分钟）；账号创建风控、429 或 DNS 解析故障首次出现即进入冷却。任务保持启用并自动恢复。</p>
 
           <div className="space-y-3 border-t border-stone-200 pt-3">
             <div className="flex items-center justify-between gap-3">
@@ -481,7 +488,7 @@ export function RegisterCard() {
             {isCooling && retryAt ? (
               <div className="flex items-center gap-2 border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                 <LoaderCircle className="size-4 shrink-0 animate-spin" />
-                连续失败冷却中，预计 {retryAt.toLocaleTimeString()} 自动恢复，无需手动重启。
+                {coolingReason}冷却中，预计 {retryAt.toLocaleTimeString()} 自动恢复，无需手动重启。
               </div>
             ) : null}
             <div className="grid grid-cols-3 gap-2">

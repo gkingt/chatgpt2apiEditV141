@@ -144,6 +144,37 @@ class RegisterConcurrencyTests(unittest.TestCase):
             self.assertIn("无需人工干预", log_text)
             self.assertIn("自动恢复", log_text)
 
+    def test_account_creation_risk_enters_backoff_after_first_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
+            attempt_times: list[float] = []
+
+            def worker(_index: int) -> dict:
+                attempt_times.append(time.monotonic())
+                if len(attempt_times) == 1:
+                    return {"ok": False, "error": "user_register_http_400: account_creation_failed"}
+                return {"ok": True}
+
+            with mock.patch.object(service, "_pool_metrics", return_value={"current_quota": 0, "current_available": 0}), mock.patch.object(
+                register_service_module.openai_register, "worker", side_effect=worker
+            ):
+                service.start(
+                    {
+                        "threads": 1,
+                        "total": 1,
+                        "mode": "total",
+                        "failure_backoff_threshold": 99,
+                        "failure_backoff_seconds": 1,
+                    }
+                )
+                self.assertTrue(self.wait_until(lambda: not service.get()["enabled"], timeout=4))
+
+            self.assertEqual(len(attempt_times), 2)
+            self.assertGreaterEqual(attempt_times[1] - attempt_times[0], 0.9)
+            log_text = "\n".join(item["text"] for item in service.get()["logs"])
+            self.assertIn("按 429 处理", log_text)
+            self.assertIn("自动恢复", log_text)
+
     def test_manual_stop_interrupts_long_failure_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
