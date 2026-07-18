@@ -27,15 +27,9 @@ class FakeSession:
         pass
 
 
-class CloudflareTempMailCooldownTests(unittest.TestCase):
-    def setUp(self):
-        with mail_provider._cloudflare_cooldown_lock:
-            mail_provider._cloudflare_cooldowns.clear()
-
+class CloudflareTempMailNoCooldownTests(unittest.TestCase):
     def tearDown(self):
         mail_provider.provider_log_sink = None
-        with mail_provider._cloudflare_cooldown_lock:
-            mail_provider._cloudflare_cooldowns.clear()
 
     @staticmethod
     def provider(session: FakeSession):
@@ -44,13 +38,12 @@ class CloudflareTempMailCooldownTests(unittest.TestCase):
             "api_base": "https://mail.example.test",
             "admin_password": "secret",
             "domain": ["example.test"],
-            "rate_limit_cooldown_seconds": 600,
         }
         conf = {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "user_agent": "test", "proxy": ""}
         with mock.patch.object(mail_provider, "_create_session", return_value=session):
             return mail_provider.CloudflareTempMailProvider(entry, conf)
 
-    def test_429_pauses_for_600_seconds_then_retries(self):
+    def test_429_fails_current_mailbox_without_sleep_or_retry(self):
         session = FakeSession(
             [
                 FakeResponse(429, text="rate limited"),
@@ -58,27 +51,14 @@ class CloudflareTempMailCooldownTests(unittest.TestCase):
             ]
         )
         provider = self.provider(session)
-        clock = [100.0]
-        sleeps = []
         logs = []
-
-        def fake_sleep(seconds):
-            sleeps.append(seconds)
-            clock[0] += seconds
-
         mail_provider.provider_log_sink = logs.append
-        with mock.patch.object(mail_provider.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
-            mail_provider.time,
-            "sleep",
-            side_effect=fake_sleep,
-        ):
-            mailbox = provider.create_mailbox("user")
+        with mock.patch.object(mail_provider.time, "sleep") as sleep, self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+            provider.create_mailbox("user")
 
-        self.assertEqual(mailbox["address"], "user@example.test")
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(sleeps, [600.0])
-        self.assertTrue(any("暂停 600 秒" in item for item in logs))
-        self.assertTrue(any("冷却结束" in item for item in logs))
+        self.assertEqual(len(session.calls), 1)
+        sleep.assert_not_called()
+        self.assertFalse(logs)
 
     def test_non_429_error_is_not_retried(self):
         session = FakeSession([FakeResponse(403, text="forbidden")])
@@ -144,27 +124,25 @@ class CloudflareTempMailCooldownTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         self.assertEqual(len(session.calls), 2)
 
-    def test_account_creation_failed_activates_the_same_600_second_cooldown(self):
+    def test_account_creation_failed_does_not_add_provider_cooldown_state(self):
         session = FakeSession([FakeResponse(200, {"address": "user@example.test", "jwt": "mail-token"})])
         provider = self.provider(session)
         mailbox = provider.create_mailbox("user")
         logs = []
         mail_provider.provider_log_sink = logs.append
 
-        with mock.patch.object(mail_provider.time, "monotonic", return_value=100.0):
-            mail_provider.mark_mailbox_result(
-                mailbox,
-                success=False,
-                error=RuntimeError(
-                    'user_register_http_400, detail={"error":{"code":"account_creation_failed"}}'
-                ),
-            )
+        mail_provider.mark_mailbox_result(
+            mailbox,
+            success=False,
+            error=RuntimeError(
+                'user_register_http_400, detail={"error":{"code":"account_creation_failed"}}'
+            ),
+        )
 
-        cooldown = mail_provider._cloudflare_cooldowns[mailbox["_rate_limit_cooldown_key"]]
-        self.assertEqual(cooldown, (700.0, False))
-        self.assertTrue(any("account_creation_failed" in item and "600 秒" in item for item in logs))
+        self.assertNotIn("_rate_limit_cooldown_key", mailbox)
+        self.assertFalse(logs)
 
-    def test_other_registration_errors_do_not_activate_email_cooldown(self):
+    def test_other_registration_errors_do_not_add_provider_cooldown_state(self):
         session = FakeSession([FakeResponse(200, {"address": "user@example.test", "jwt": "mail-token"})])
         provider = self.provider(session)
         mailbox = provider.create_mailbox("user")
@@ -175,7 +153,7 @@ class CloudflareTempMailCooldownTests(unittest.TestCase):
             error=RuntimeError("user_register_http_400, code=invalid_auth_step"),
         )
 
-        self.assertNotIn(mailbox["_rate_limit_cooldown_key"], mail_provider._cloudflare_cooldowns)
+        self.assertNotIn("_rate_limit_cooldown_key", mailbox)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,6 @@ export function RegisterCard() {
   const setTargetQuota = useSettingsStore((state) => state.setRegisterTargetQuota);
   const setTargetAvailable = useSettingsStore((state) => state.setRegisterTargetAvailable);
   const setCheckInterval = useSettingsStore((state) => state.setRegisterCheckInterval);
-  const setFailureBackoffSeconds = useSettingsStore((state) => state.setRegisterFailureBackoffSeconds);
   const setMailField = useSettingsStore((state) => state.setRegisterMailField);
   const setMailApiUseRegisterProxy = useSettingsStore((state) => state.setRegisterMailApiUseRegisterProxy);
   const addProvider = useSettingsStore((state) => state.addRegisterProvider);
@@ -54,9 +53,6 @@ export function RegisterCard() {
   if (!config) return null;
 
   const stats = config.stats || { success: 0, fail: 0, done: 0, running: 0, threads: config.threads };
-  const retryAt = stats.retry_at ? new Date(stats.retry_at) : null;
-  const isCooling = Boolean(config.enabled && retryAt && retryAt.getTime() > Date.now());
-  const coolingReason = "HTTP 429 限流";
   const providers = config.mail.providers || [];
   const logs = config.logs || [];
   const updateProviderType = (index: number, type: string) => {
@@ -65,7 +61,7 @@ export function RegisterCard() {
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
       ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [] } : {}),
-      ...(type === "tempmail_lol" ? { api_key: "", domain: [], rate_per_window: 24, window_seconds: 300, rate_limit_cooldown_seconds: 600, max_wait: 600, create_total_budget: 90 } : {}),
+      ...(type === "tempmail_lol" ? { api_key: "", domain: [] } : {}),
       ...(type === "moemail" ? { api_base: "", api_key: "", domain: [] } : {}),
       ...(type === "inbucket" ? { api_base: "", domain: [], random_subdomain: true } : {}),
       ...(type === "duckmail" ? { api_key: "", default_domain: "duckmail.sbs" } : {}),
@@ -146,13 +142,9 @@ export function RegisterCard() {
               <label className="text-sm text-stone-700">检查间隔（秒）</label>
               <Input value={String(config.check_interval || "")} onChange={(event) => setCheckInterval(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled || config.mode === "total"} />
             </div>
-            <div className="space-y-2">
-              <label className="text-sm text-stone-700">429 冷却时间（秒）</label>
-              <Input type="number" min={1} value={String(config.failure_backoff_seconds || 1200)} onChange={(event) => setFailureBackoffSeconds(event.target.value)} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-            </div>
           </div>
 
-          <p className="text-xs leading-5 text-stone-500">只有明确的 HTTP 429/限流才冷却，默认 1200 秒（20 分钟）。账号创建失败、验证码失败和网络错误会继续注册，不会触发全局冷却。</p>
+          <p className="text-xs leading-5 text-stone-500">注册失败后立即结束当前任务并启动下一个，不设置 HTTP 429 或其他全局冷却。</p>
 
           <div className="space-y-3 border-t border-stone-200 pt-3">
             <div className="flex items-center justify-between gap-3">
@@ -293,30 +285,6 @@ export function RegisterCard() {
                           <Input value={String(provider.api_key || "")} onChange={(event) => updateProvider(index, { api_key: event.target.value })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
                         </div>
                       ) : null}
-                      {type === "tempmail_lol" ? (
-                        <>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">每窗口请求上限</label>
-                            <Input type="number" min={1} max={25} value={String(provider.rate_per_window ?? 24)} onChange={(event) => updateProvider(index, { rate_per_window: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">限流窗口（秒）</label>
-                            <Input type="number" min={10} value={String(provider.window_seconds ?? 300)} onChange={(event) => updateProvider(index, { window_seconds: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">HTTP 429 全线程冷却（秒）</label>
-                            <Input type="number" min={1} value={String(provider.rate_limit_cooldown_seconds ?? 600)} onChange={(event) => updateProvider(index, { rate_limit_cooldown_seconds: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">全部 Key 限流时最长等待（秒）</label>
-                            <Input type="number" min={0} value={String(provider.max_wait ?? 600)} onChange={(event) => updateProvider(index, { max_wait: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
-                          <div className="space-y-2">
-                            <label className="text-sm text-stone-700">网络错误重试预算（秒，不含限流等待）</label>
-                            <Input type="number" min={15} value={String(provider.create_total_budget ?? 90)} onChange={(event) => updateProvider(index, { create_total_budget: Number(event.target.value) })} className="h-10 rounded-xl border-stone-200 bg-white" disabled={config.enabled} />
-                          </div>
-                        </>
-                      ) : null}
                       {type === "duckmail" || type === "gptmail" ? (
                         <div className="space-y-2">
                           <label className="text-sm text-stone-700">Default Domain</label>
@@ -452,7 +420,7 @@ export function RegisterCard() {
                 <p className="mt-1 text-sm text-stone-500">SSE 实时推送当前状态。</p>
               </div>
               <Badge variant={config.enabled ? "success" : "secondary"} className="rounded-md">
-                {isCooling ? "冷却等待" : config.enabled ? "运行中" : "已停止"}
+                {config.enabled ? "运行中" : "已停止"}
               </Badge>
             </div>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -474,12 +442,6 @@ export function RegisterCard() {
                 </div>
               ))}
             </div>
-            {isCooling && retryAt ? (
-              <div className="flex items-center gap-2 border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                <LoaderCircle className="size-4 shrink-0 animate-spin" />
-                {coolingReason}冷却中，预计 {retryAt.toLocaleTimeString()} 自动恢复，无需手动重启。
-              </div>
-            ) : null}
             <div className="grid grid-cols-3 gap-2">
               <Button className="h-10 rounded-xl bg-stone-950 px-3 text-white hover:bg-stone-800" onClick={() => void toggle()} disabled={isSaving}>
                 {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : config.enabled ? <Square className="size-4" /> : <Play className="size-4" />}

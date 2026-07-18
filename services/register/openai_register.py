@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import random
 import re
@@ -13,13 +11,18 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from curl_cffi import requests
 
 from services.account_service import account_service
 from services.proxy_service import ClearanceBundle, proxy_settings
 from services.register import mail_provider
+from utils.pkce import generate_pkce as _generate_pkce
+from utils.sentinel import (
+    build_sentinel_headers_with_sdk as _build_sentinel_headers_with_sdk,
+    build_sentinel_token as _build_sentinel_token_tuple,
+)
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -144,9 +147,6 @@ def _make_trace_headers() -> dict[str, str]:
     }
 
 
-from utils.pkce import generate_pkce as _generate_pkce  # noqa: F401
-
-
 def _random_password(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%"
     value = list(
@@ -265,16 +265,21 @@ def wait_for_code(mailbox: dict, register_proxy: str = "") -> str | None:
     return mail_provider.wait_for_code(_mail_config(register_proxy), mailbox)
 
 
-from utils.sentinel import (  # noqa: F401
-    SentinelTokenGenerator,
-    build_sentinel_headers_with_sdk as _build_sentinel_headers_with_sdk,
-    build_sentinel_token as _build_sentinel_token_tuple,
-)
-
-
 def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
     """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
-    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
+    sentinel_val, oai_sc_value = _build_sentinel_token_tuple(
+        session,
+        device_id,
+        flow,
+        user_agent=user_agent,
+        sec_ch_ua=sec_ch_ua,
+    )
+    if oai_sc_value:
+        for domain in (".auth.openai.com", "auth.openai.com"):
+            try:
+                session.cookies.set("oai-sc", oai_sc_value, domain=domain)
+            except Exception:
+                continue
     return sentinel_val
 
 
@@ -382,6 +387,28 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
     if not code:
         return None
     return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
+
+
+def _extract_continue_url(data: dict[str, Any] | None) -> str:
+    if not isinstance(data, dict):
+        return ""
+    direct = str(data.get("continue_url") or data.get("continueUrl") or "").strip()
+    if direct:
+        return direct
+    page = data.get("page") if isinstance(data.get("page"), dict) else {}
+    payload = page.get("payload") if isinstance(page.get("payload"), dict) else {}
+    return str(payload.get("continue_url") or payload.get("continueUrl") or "").strip()
+
+
+def _absolute_auth_url(url: str) -> str:
+    return urljoin(f"{auth_base}/", str(url or "").strip())
+
+
+def _url_path(url: str) -> str:
+    try:
+        return urlparse(_absolute_auth_url(url)).path.rstrip("/") or "/"
+    except Exception:
+        return ""
 
 
 def request_platform_oauth_token(session: requests.Session, code: str, code_verifier: str) -> dict | None:
@@ -505,85 +532,123 @@ class PlatformRegistrar:
         step(index, "ChatGPT 会话初始化完成")
 
     def _chatgpt_authorize(self, email: str, index: int) -> None:
+        """Initialize the browser-backed ChatGPT signup challenge.
+
+        The email is submitted by ``_authorize_signup``. Keeping it out of the
+        NextAuth bootstrap avoids mixing login hints with a fresh signup state.
+        """
         self._boot_chatgpt_session(index)
-        csrf_url = f"{chatgpt_base}/api/auth/csrf"
-        csrf_browser_headers = {
-            "accept": "application/json",
-            "referer": f"{chatgpt_base}/",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": user_agent,
-        }
-        csrf_headers = _headers_with_clearance(
-            csrf_browser_headers,
-            csrf_url,
-            self.proxy,
-            self.clearance_user_agent,
-        )
-        csrf_resp, error = request_with_local_retry(
-            self.session,
-            "get",
-            csrf_url,
-            headers=csrf_headers,
-            verify=False,
-        )
-        csrf_data = _response_json(csrf_resp) if csrf_resp is not None else {}
-        csrf_token = str(csrf_data.get("csrfToken") or "").strip()
-        if csrf_resp is None or csrf_resp.status_code != 200 or not csrf_token:
-            raise RuntimeError(error or f"chatgpt_csrf_http_{getattr(csrf_resp, 'status_code', 'unknown')}")
 
-        query = urlencode({
-            "prompt": "login",
-            "ext-oai-did": self.device_id,
-            "auth_session_logging_id": str(uuid.uuid4()),
-            "ext-passkey-client-capabilities": "0111",
-            "screen_hint": "login_or_signup",
-            "login_hint": email,
-        })
-        signin_url = f"{chatgpt_base}/api/auth/signin/openai?{query}"
-        signin_headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/x-www-form-urlencoded",
-            "origin": chatgpt_base,
-            "referer": f"{chatgpt_base}/",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": user_agent,
-        }
-        signin_headers = _headers_with_clearance(signin_headers, signin_url, self.proxy, self.clearance_user_agent)
-        signin_resp, error = request_with_local_retry(
-            self.session,
-            "post",
-            signin_url,
-            data={"callbackUrl": f"{chatgpt_base}/", "csrfToken": csrf_token, "json": "true"},
-            headers=signin_headers,
-            allow_redirects=True,
-            verify=False,
-        )
-        signin_data = _response_json(signin_resp) if signin_resp is not None else {}
-        authorize_url = str(signin_data.get("url") or "").strip()
-        if signin_resp is None or signin_resp.status_code != 200 or not authorize_url:
-            raise RuntimeError(error or f"chatgpt_signin_http_{getattr(signin_resp, 'status_code', 'unknown')}")
+        def begin_signin() -> tuple[str, object | None, str]:
+            csrf_url = f"{chatgpt_base}/api/auth/csrf"
+            csrf_headers = _headers_with_clearance(
+                {
+                    "accept": "application/json",
+                    "referer": f"{chatgpt_base}/auth/login",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "user-agent": user_agent,
+                },
+                csrf_url,
+                self.proxy,
+                self.clearance_user_agent,
+            )
+            csrf_resp, csrf_error = request_with_local_retry(
+                self.session,
+                "get",
+                csrf_url,
+                headers=csrf_headers,
+                verify=False,
+            )
+            csrf_token = str(_response_json(csrf_resp).get("csrfToken") or "").strip()
+            if csrf_resp is None or csrf_resp.status_code != 200 or not csrf_token:
+                raise RuntimeError(
+                    csrf_error
+                    or f"chatgpt_csrf_http_{getattr(csrf_resp, 'status_code', 'unknown')}, "
+                    f"{_response_debug_detail(csrf_resp, 400)}"
+                )
 
-        authorize_headers = _headers_with_clearance(
-            self._navigate_headers(f"{chatgpt_base}/"),
-            authorize_url,
-            self.proxy,
-            self.clearance_user_agent,
+            signin_url = f"{chatgpt_base}/api/auth/signin/openai"
+            signin_headers = _headers_with_clearance(
+                {
+                    "accept": "application/json",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "origin": chatgpt_base,
+                    "referer": f"{chatgpt_base}/auth/login",
+                    "user-agent": user_agent,
+                },
+                signin_url,
+                self.proxy,
+                self.clearance_user_agent,
+            )
+            signin_resp, signin_error = request_with_local_retry(
+                self.session,
+                "post",
+                signin_url,
+                data={"csrfToken": csrf_token, "callbackUrl": f"{chatgpt_base}/", "json": "true"},
+                headers=signin_headers,
+                verify=False,
+            )
+            return str(_response_json(signin_resp).get("url") or "").strip(), signin_resp, signin_error
+
+        authorize_url, signin_resp, error = begin_signin()
+        parsed = urlparse(authorize_url)
+        if parsed.netloc == "chatgpt.com" and parsed.path == "/api/auth/signin":
+            authorize_url, signin_resp, error = begin_signin()
+            parsed = urlparse(authorize_url)
+        valid_authorize_url = (
+            parsed.scheme == "https"
+            and parsed.netloc == "auth.openai.com"
+            and "/api/accounts/authorize" in parsed.path
         )
-        resp, error = request_with_local_retry(
-            self.session,
-            "get",
-            authorize_url,
-            headers=authorize_headers,
-            allow_redirects=True,
-            verify=False,
-        )
+        if signin_resp is None or signin_resp.status_code != 200 or not valid_authorize_url:
+            raise RuntimeError(
+                error
+                or f"chatgpt_signin_http_{getattr(signin_resp, 'status_code', 'unknown')}, "
+                f"authorize_url={authorize_url[:240]}, {_response_debug_detail(signin_resp, 400)}"
+            )
+
+        def authorize():
+            headers = _headers_with_clearance(
+                self._navigate_headers(f"{chatgpt_base}/auth/login"),
+                authorize_url,
+                self.proxy,
+                self.clearance_user_agent,
+            )
+            return request_with_local_retry(
+                self.session,
+                "get",
+                authorize_url,
+                headers=headers,
+                allow_redirects=True,
+                verify=False,
+            )
+
+        resp, error = authorize()
+        if _is_cloudflare_challenge(resp):
+            bundle = self._refresh_cloudflare_clearance(auth_base, index)
+            if bundle is None:
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+            resp, error = authorize()
         if resp is None or resp.status_code != 200:
-            raise RuntimeError(error or f"chatgpt_authorize_http_{getattr(resp, 'status_code', 'unknown')}")
+            raise RuntimeError(
+                error
+                or f"chatgpt_authorize_http_{getattr(resp, 'status_code', 'unknown')}, "
+                f"{_response_debug_detail(resp, 400)}"
+            )
+
+        device_id = ""
+        try:
+            device_id = str(self.session.cookies.get("oai-did", "") or "").strip()
+        except Exception:
+            pass
+        self.device_id = device_id or str((parse_qs(parsed.query).get("device_id") or [""])[0]).strip() or self.device_id
+        for domain in (".auth.openai.com", "auth.openai.com"):
+            try:
+                self.session.cookies.set("oai-did", self.device_id, domain=domain)
+            except Exception:
+                continue
         step(index, f"ChatGPT authorize 完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
 
     @staticmethod
@@ -729,6 +794,77 @@ class PlatformRegistrar:
             debug = _response_debug_detail(resp)
             raise RuntimeError(error or f"authorize_continue_http_{getattr(resp, 'status_code', 'unknown')}, {debug}")
         step(index, f"authorize continue 完成 url={str(getattr(resp, 'url', '') or '')[:160]}")
+
+    def _authorize_signup(self, email: str, index: int) -> str:
+        """Submit the email to the active authorize challenge.
+
+        This mirrors the browser's authorize/continue transition and returns
+        the upstream-selected registration branch. OTP polling and validation
+        remain owned by the existing project implementation.
+        """
+        step(index, "提交 ChatGPT 注册邮箱")
+        url = f"{auth_base}/api/accounts/authorize/continue"
+
+        def submit():
+            headers = self._json_headers(f"{auth_base}/create-account")
+            headers["openai-sentinel-token"] = build_sentinel_token(
+                self.session,
+                self.device_id,
+                "authorize_continue",
+            )
+            headers = _headers_with_clearance(headers, url, self.proxy, self.clearance_user_agent)
+            return request_with_local_retry(
+                self.session,
+                "post",
+                url,
+                json={"username": {"value": email, "kind": "email"}, "screen_hint": "signup"},
+                headers=headers,
+                allow_redirects=False,
+                verify=False,
+            )
+
+        resp, error = submit()
+        if _is_cloudflare_challenge(resp):
+            bundle = self._refresh_cloudflare_clearance(auth_base, index)
+            if bundle is None:
+                raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
+            resp, error = submit()
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(
+                error
+                or f"authorize_signup_http_{getattr(resp, 'status_code', 'unknown')}, "
+                f"{_response_debug_detail(resp, 400)}"
+            )
+
+        data = _response_json(resp)
+        page = data.get("page") if isinstance(data.get("page"), dict) else {}
+        page_type = str(page.get("type") or "").strip()
+        continue_url = _extract_continue_url(data)
+        page_mode = {
+            "create_account_password": "password",
+            "email_otp_verification": "otp",
+        }.get(page_type)
+        continue_mode = {
+            "/create-account/password": "password",
+            "/email-verification": "otp",
+        }.get(_url_path(continue_url))
+        if page_mode and continue_mode and page_mode != continue_mode:
+            raise RuntimeError(
+                f"authorize_signup_state_conflict: page_type={page_type}, continue_path={_url_path(continue_url)}"
+            )
+        mode = page_mode or continue_mode
+        if mode not in {"password", "otp"}:
+            raise RuntimeError(
+                f"authorize_signup_unknown_state: page_type={page_type or '?'}, continue_path={_url_path(continue_url) or '?'}"
+            )
+        if mode == "password":
+            self._follow_authorize_continue(
+                continue_url or f"{auth_base}/create-account/password",
+                f"{auth_base}/create-account",
+                index,
+            )
+        step(index, f"ChatGPT 注册邮箱提交完成，流程={mode}")
+        return mode
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
@@ -883,10 +1019,12 @@ class PlatformRegistrar:
         label = str(mailbox.get("label") or "")
         step(index, f"邮箱创建完成[{label}]: {email}")
         try:
-            password = _random_password()
             first_name, last_name = _random_name()
             self._chatgpt_authorize(email, index)
-            self._register_user(email, password, index)
+            signup_mode = self._authorize_signup(email, index)
+            password = _random_password() if signup_mode == "password" else ""
+            if password:
+                self._register_user(email, password, index)
             self._send_otp(index, mailbox)
             self._validate_mailbox_otp(mailbox, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)

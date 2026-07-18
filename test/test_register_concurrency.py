@@ -20,14 +20,10 @@ class RegisterConcurrencyTests(unittest.TestCase):
             time.sleep(0.01)
         return bool(predicate())
 
-    def test_only_explicit_rate_limits_trigger_immediate_backoff(self) -> None:
-        self.assertEqual(register_service_module._immediate_backoff_reason("account_creation_failed"), "")
-        self.assertEqual(register_service_module._immediate_backoff_reason("registration_disallowed"), "")
-        self.assertEqual(register_service_module._immediate_backoff_reason("Could not resolve host"), "")
-        self.assertEqual(register_service_module._immediate_backoff_reason("等待注册验证码超时"), "")
-        self.assertEqual(register_service_module._immediate_backoff_reason("rate limit exceeded"), "")
-        self.assertEqual(register_service_module._immediate_backoff_reason("Too Many Requests"), "")
-        self.assertEqual(register_service_module._immediate_backoff_reason("HTTP 429 Too Many Requests"), "rate_limit")
+    def test_normalize_removes_legacy_failure_cooldown(self) -> None:
+        config = register_service_module._normalize({"failure_backoff_seconds": 1200})
+
+        self.assertNotIn("failure_backoff_seconds", config)
 
     def test_normalize_keeps_tempmail_domains_without_legacy_cooldown(self) -> None:
         config = register_service_module._normalize(
@@ -41,6 +37,11 @@ class RegisterConcurrencyTests(unittest.TestCase):
                             "domain": "First.Example\nsecond.example,first.example",
                             "domain_cooldown_threshold": 3,
                             "domain_cooldown_seconds": 21600,
+                            "rate_per_window": 24,
+                            "window_seconds": 300,
+                            "rate_limit_cooldown_seconds": 600,
+                            "max_wait": 600,
+                            "create_total_budget": 90,
                         }
                     ]
                 }
@@ -51,6 +52,11 @@ class RegisterConcurrencyTests(unittest.TestCase):
         self.assertEqual(provider["domain"], ["first.example", "second.example"])
         self.assertNotIn("domain_cooldown_threshold", provider)
         self.assertNotIn("domain_cooldown_seconds", provider)
+        self.assertNotIn("rate_per_window", provider)
+        self.assertNotIn("window_seconds", provider)
+        self.assertNotIn("rate_limit_cooldown_seconds", provider)
+        self.assertNotIn("max_wait", provider)
+        self.assertNotIn("create_total_budget", provider)
 
     def test_normalize_clears_stale_runtime_state_when_disabled(self) -> None:
         config = register_service_module._normalize(
@@ -110,6 +116,41 @@ class RegisterConcurrencyTests(unittest.TestCase):
             self.assertEqual(max_active, 3)
             self.assertFalse(service.get()["enabled"])
 
+    def test_restart_applies_latest_provider_flags_while_old_runner_is_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            register_service_module.openai_register.config,
+            {},
+            clear=False,
+        ):
+            service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
+            runner = mock.Mock()
+            runner.is_alive.return_value = True
+            service._runner = runner
+            providers = [
+                {
+                    "type": "cloudflare_temp_email",
+                    "enable": False,
+                    "api_base": "https://mail.example.test",
+                    "admin_password": "secret",
+                    "domain": [],
+                },
+                {
+                    "type": "tempmail_lol",
+                    "enable": True,
+                    "api_key": "test-key",
+                    "domain": [],
+                },
+            ]
+
+            result = service.start({"mail": {"providers": providers}})
+
+            self.assertTrue(result["enabled"])
+            self.assertFalse(result["mail"]["providers"][0]["enable"])
+            self.assertTrue(result["mail"]["providers"][1]["enable"])
+            runtime_providers = register_service_module.openai_register.config["mail"]["providers"]
+            self.assertFalse(runtime_providers[0]["enable"])
+            self.assertTrue(runtime_providers[1]["enable"])
+
     def test_total_mode_counts_successes_instead_of_failed_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
@@ -156,7 +197,6 @@ class RegisterConcurrencyTests(unittest.TestCase):
                         "threads": 1,
                         "total": 1,
                         "mode": "total",
-                        "failure_backoff_seconds": 1,
                     }
                 )
                 self.assertTrue(self.wait_until(lambda: not service.get()["enabled"], timeout=4))
@@ -186,7 +226,6 @@ class RegisterConcurrencyTests(unittest.TestCase):
                         "threads": 1,
                         "total": 1,
                         "mode": "total",
-                        "failure_backoff_seconds": 1,
                     }
                 )
                 self.assertTrue(self.wait_until(lambda: not service.get()["enabled"], timeout=4))
@@ -197,7 +236,7 @@ class RegisterConcurrencyTests(unittest.TestCase):
             self.assertNotIn("HTTP 429", log_text)
             self.assertNotIn("自动恢复", log_text)
 
-    def test_http_429_enters_backoff_then_resumes_automatically(self) -> None:
+    def test_http_429_continues_immediately_without_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
             attempt_times: list[float] = []
@@ -216,34 +255,38 @@ class RegisterConcurrencyTests(unittest.TestCase):
                         "threads": 1,
                         "total": 1,
                         "mode": "total",
-                        "failure_backoff_seconds": 1,
                     }
                 )
                 self.assertTrue(self.wait_until(lambda: not service.get()["enabled"], timeout=4))
 
             self.assertEqual(len(attempt_times), 2)
-            self.assertGreaterEqual(attempt_times[1] - attempt_times[0], 0.9)
+            self.assertLess(attempt_times[1] - attempt_times[0], 0.5)
             log_text = "\n".join(item["text"] for item in service.get()["logs"])
-            self.assertIn("HTTP 429/明确限流", log_text)
-            self.assertIn("自动恢复", log_text)
+            self.assertNotIn("冷却", log_text)
+            self.assertIsNone(service.get()["stats"].get("retry_at"))
 
-    def test_manual_stop_interrupts_long_failure_cooldown(self) -> None:
+    def test_manual_stop_still_interrupts_continuous_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = register_service_module.RegisterService(Path(temp_dir) / "register.json")
+            attempted = threading.Event()
+
+            def fail(_index: int) -> dict:
+                attempted.set()
+                return {"ok": False, "error": "HTTP 429 Too Many Requests"}
+
             with mock.patch.object(service, "_pool_metrics", return_value={"current_quota": 0, "current_available": 0}), mock.patch.object(
                 register_service_module.openai_register,
                 "worker",
-                return_value={"ok": False, "error": "HTTP 429 Too Many Requests"},
+                side_effect=fail,
             ):
                 service.start(
                     {
                         "threads": 1,
                         "total": 1,
                         "mode": "total",
-                        "failure_backoff_seconds": 1200,
                     }
                 )
-                self.assertTrue(self.wait_until(lambda: bool(service.get()["stats"].get("retry_at"))))
+                self.assertTrue(attempted.wait(1))
                 service.stop()
                 self.assertTrue(self.wait_until(lambda: not service._runner or not service._runner.is_alive(), timeout=3))
 
@@ -272,7 +315,6 @@ class RegisterConcurrencyTests(unittest.TestCase):
                         "threads": 1,
                         "total": 1,
                         "mode": "total",
-                        "failure_backoff_seconds": 1200,
                     }
                 )
                 self.assertTrue(self.wait_until(lambda: not service.get()["enabled"], timeout=3))

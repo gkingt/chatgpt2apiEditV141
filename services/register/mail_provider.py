@@ -7,7 +7,6 @@ import random
 import re
 import string
 import time
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from email import message_from_bytes, message_from_string, policy
 from email.header import decode_header, make_header
@@ -211,8 +210,6 @@ provider_index = 0
 cloudmail_token_lock = Lock()
 cloudmail_token_cache: dict[str, tuple[str, float]] = {}
 provider_log_sink: Callable[[str], None] | None = None
-_cloudflare_cooldown_lock = Lock()
-_cloudflare_cooldowns: dict[str, tuple[float, bool]] = {}
 
 
 def _provider_log(message: str) -> None:
@@ -223,35 +220,6 @@ def _provider_log(message: str) -> None:
         except Exception:
             pass
     print(message)
-
-
-def _activate_cloudflare_cooldown(key: str, seconds: float) -> bool:
-    now = time.monotonic()
-    with _cloudflare_cooldown_lock:
-        current = _cloudflare_cooldowns.get(key)
-        if current and current[0] > now:
-            return False
-        _cloudflare_cooldowns[key] = (now + max(1.0, seconds), False)
-        return True
-
-
-def _wait_for_cloudflare_cooldown(key: str) -> None:
-    while True:
-        should_log_resume = False
-        with _cloudflare_cooldown_lock:
-            current = _cloudflare_cooldowns.get(key)
-            if not current:
-                return
-            until, resume_logged = current
-            remaining = until - time.monotonic()
-            if remaining <= 0:
-                if not resume_logged:
-                    _cloudflare_cooldowns[key] = (until, True)
-                    should_log_resume = True
-                break
-        time.sleep(remaining)
-    if should_log_resume:
-        _provider_log("CloudflareTempMail 429 冷却结束，恢复邮箱请求")
 
 
 def _config(mail_config: dict) -> dict:
@@ -540,29 +508,13 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
         self.domain = entry.get("domain") or []
-        try:
-            cooldown = float(entry.get("rate_limit_cooldown_seconds") or 600)
-        except (TypeError, ValueError):
-            cooldown = 600.0
-        self.rate_limit_cooldown_seconds = max(1.0, cooldown)
-        self._cooldown_key = f"{self.api_base}|{self.provider_ref or self.name}"
         self.session = _create_session(conf)
 
     def _request(self, method: str, path: str, headers: dict | None = None, params: dict | None = None, payload: dict | None = None, expected: tuple[int, ...] = (200,)):
-        while True:
-            _wait_for_cloudflare_cooldown(self._cooldown_key)
-            resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
-            if resp.status_code == 429:
-                activated = _activate_cloudflare_cooldown(self._cooldown_key, self.rate_limit_cooldown_seconds)
-                if activated:
-                    _provider_log(
-                        f"CloudflareTempMail 触发 HTTP 429，所有线程暂停 {self.rate_limit_cooldown_seconds:.0f} 秒后自动恢复"
-                    )
-                _wait_for_cloudflare_cooldown(self._cooldown_key)
-                continue
-            if resp.status_code not in expected:
-                raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
-            return {} if resp.status_code == 204 else resp.json()
+        resp = self.session.request(method.upper(), f"{self.api_base}{path}", headers={"Content-Type": "application/json", "User-Agent": self.conf["user_agent"], **(headers or {})}, params=params, json=payload, timeout=self.conf["request_timeout"], verify=False)
+        if resp.status_code not in expected:
+            raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
+        return {} if resp.status_code == 204 else resp.json()
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
         data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
@@ -575,8 +527,6 @@ class CloudflareTempMailProvider(BaseMailProvider):
             "provider_ref": self.provider_ref,
             "address": address,
             "token": token,
-            "_rate_limit_cooldown_key": self._cooldown_key,
-            "_rate_limit_cooldown_seconds": self.rate_limit_cooldown_seconds,
         }
 
     def get_existing_mailbox(self, email: str) -> dict[str, Any]:
@@ -964,7 +914,6 @@ class CloudMailGenProvider(BaseMailProvider):
 
 TEMPMAIL_LOL_API_BASE = "https://api.tempmail.lol/v2"
 _TEMPMAIL_KEY_SPLIT_RE = re.compile(r"[\s,，;；]+")
-_TEMPMAIL_TRANSIENT_STATUSES = {500, 502, 503, 504, 520, 521, 522, 523, 524}
 TEMPMAIL_DOMAIN_STATS_FILE = DATA_DIR / "tempmail_domain_stats.json"
 _tempmail_domain_stats_lock = Lock()
 
@@ -1079,119 +1028,29 @@ def _parse_tempmail_keys(raw: Any) -> list[str]:
     return keys or [""]
 
 
-def _tempmail_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _tempmail_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 class _TempMailKeyPool:
-    """Thread-safe sliding-window limiter shared by short-lived provider instances."""
+    """Thread-safe round-robin key selector without registration throttling."""
 
-    def __init__(self, keys: list[str], rate: int, window: float):
+    def __init__(self, keys: list[str]):
         self.keys = list(keys)
-        self.rate = max(1, rate)
-        self.window = max(10.0, window)
         self._lock = Lock()
-        self._usage = {key: deque() for key in self.keys}
-        self._rate_limited_until = {key: 0.0 for key in self.keys}
-        self._global_rate_limited_until = 0.0
-        self._global_cooldown_active = False
         self._cursor = 0
 
-    def _trim_locked(self, key: str, now: float) -> None:
-        usage = self._usage.setdefault(key, deque())
-        threshold = now - self.window
-        while usage and usage[0] <= threshold:
-            usage.popleft()
-
-    def acquire(self, max_wait: float) -> str:
-        deadline = time.monotonic() + max(0.0, max_wait)
-        while True:
-            with self._lock:
-                now = time.monotonic()
-                earliest_wait = float("inf")
-                for offset in range(len(self.keys)):
-                    index = (self._cursor + offset) % len(self.keys)
-                    key = self.keys[index]
-                    self._trim_locked(key, now)
-                    usage = self._usage[key]
-                    if len(usage) < self.rate:
-                        # Reserve the request while holding the lock so concurrent workers
-                        # cannot all claim the final slot in the same rate window.
-                        usage.append(now)
-                        self._cursor = (index + 1) % len(self.keys)
-                        return key
-                    earliest_wait = min(earliest_wait, usage[0] + self.window - now)
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError(f"TempMail.lol 所有 API Key 均已达到限速，等待超过 {max_wait:.0f} 秒")
-            time.sleep(min(max(0.5, earliest_wait), remaining, 5.0))
-
-    def mark_rate_limited(self, key: str) -> None:
-        with self._lock:
-            now = time.monotonic()
-            usage = self._usage.setdefault(key, deque())
-            usage.clear()
-            usage.extend(now for _ in range(self.rate))
-            self._rate_limited_until[key] = now + self.window
-
-    def activate_global_cooldown(self, seconds: float) -> bool:
-        """Pause mailbox creation across all providers sharing this key pool."""
-        with self._lock:
-            now = time.monotonic()
-            until = now + max(1.0, seconds)
-            if self._global_cooldown_active and self._global_rate_limited_until > now:
-                self._global_rate_limited_until = max(self._global_rate_limited_until, until)
-                return False
-            self._global_rate_limited_until = until
-            self._global_cooldown_active = True
-            return True
-
-    def wait_for_global_cooldown(self) -> float:
-        """Wait for the shared 429 cooldown and return time excluded from retry budgets."""
-        started = time.monotonic()
-        waited = False
-        while True:
-            should_log_resume = False
-            with self._lock:
-                if not self._global_cooldown_active:
-                    return max(0.0, time.monotonic() - started) if waited else 0.0
-                remaining = self._global_rate_limited_until - time.monotonic()
-                if remaining <= 0:
-                    self._global_cooldown_active = False
-                    should_log_resume = True
-            if should_log_resume:
-                _provider_log("TempMail.lol 429 冷却结束，恢复邮箱创建")
-                return max(0.0, time.monotonic() - started) if waited else 0.0
-            waited = True
-            time.sleep(remaining)
-
-    def cooldown_remaining(self, key: str) -> float:
-        with self._lock:
-            return max(0.0, float(self._rate_limited_until.get(key) or 0.0) - time.monotonic())
-
-    def available_key(self, *, exclude: set[str] | None = None) -> str | None:
+    def next_key(self, *, exclude: set[str] | None = None) -> str | None:
         excluded = exclude or set()
         with self._lock:
-            now = time.monotonic()
-            for key in self.keys:
-                if key not in excluded and float(self._rate_limited_until.get(key) or 0.0) <= now:
-                    return key
+            for offset in range(len(self.keys)):
+                index = (self._cursor + offset) % len(self.keys)
+                key = self.keys[index]
+                if key in excluded:
+                    continue
+                self._cursor = (index + 1) % len(self.keys)
+                return key
         return None
 
 
 _tempmail_pool_lock = Lock()
-_tempmail_pools: dict[str, tuple[tuple[tuple[str, ...], int, float], _TempMailKeyPool]] = {}
+_tempmail_pools: dict[str, tuple[tuple[str, ...], _TempMailKeyPool]] = {}
 _tempmail_token_key_lock = Lock()
 _tempmail_token_keys: dict[str, str] = {}
 _tempmail_domain_cursor_lock = Lock()
@@ -1227,13 +1086,13 @@ def _next_tempmail_domain(provider_ref: str, domains: list[str]) -> str:
         return domain
 
 
-def _get_tempmail_pool(provider_ref: str, keys: list[str], rate: int, window: float) -> _TempMailKeyPool:
+def _get_tempmail_pool(provider_ref: str, keys: list[str]) -> _TempMailKeyPool:
     pool_key = provider_ref or "tempmail_lol#default"
-    signature = (tuple(keys), rate, window)
+    signature = tuple(keys)
     with _tempmail_pool_lock:
         current = _tempmail_pools.get(pool_key)
         if current is None or current[0] != signature:
-            pool = _TempMailKeyPool(keys, rate, window)
+            pool = _TempMailKeyPool(keys)
             _tempmail_pools[pool_key] = (signature, pool)
             return pool
         return current[1]
@@ -1261,17 +1120,6 @@ class _TempMailLolRequestError(RuntimeError):
         self.status_code = status_code
 
 
-def _classify_tempmail_error(error: _TempMailLolRequestError) -> str:
-    status = error.status_code
-    if status == 429:
-        return "rate_limit"
-    if status in _TEMPMAIL_TRANSIENT_STATUSES or (status is not None and 500 <= status < 600):
-        return "transient"
-    if status is not None and 400 <= status < 500:
-        return "fatal"
-    return "transient"
-
-
 class TempMailLolProvider(BaseMailProvider):
     name = "tempmail_lol"
 
@@ -1280,18 +1128,7 @@ class TempMailLolProvider(BaseMailProvider):
         raw_keys = entry.get("api_key") or entry.get("tempmail_api_key") or ""
         self.api_keys = _parse_tempmail_keys(raw_keys)
         self.domains = parse_tempmail_domains(entry.get("domain"))
-        self.rate_per_window = max(1, _tempmail_int(entry.get("rate_per_window", entry.get("tempmail_rate_per_window", 24)), 24))
-        self.window_seconds = max(10.0, _tempmail_float(entry.get("window_seconds", entry.get("tempmail_window_seconds", 300)), 300))
-        self.max_wait = max(0.0, _tempmail_float(entry.get("max_wait", entry.get("tempmail_max_wait", 600)), 600))
-        self.create_total_budget = max(15.0, _tempmail_float(entry.get("create_total_budget", entry.get("tempmail_create_total_budget", 90)), 90))
-        self.rate_limit_cooldown_seconds = max(
-            1.0,
-            _tempmail_float(
-                entry.get("rate_limit_cooldown_seconds", entry.get("tempmail_rate_limit_cooldown_seconds", 600)),
-                600,
-            ),
-        )
-        self.key_pool = _get_tempmail_pool(self.provider_ref, self.api_keys, self.rate_per_window, self.window_seconds)
+        self.key_pool = _get_tempmail_pool(self.provider_ref, self.api_keys)
         self._last_status_code: int | None = None
         self.session = _create_session(conf)
         self.session.headers.update({"User-Agent": conf["user_agent"], "Accept": "application/json", "Content-Type": "application/json"})
@@ -1331,67 +1168,31 @@ class TempMailLolProvider(BaseMailProvider):
             )
         return data
 
-    def _activate_rate_limit_cooldown(self) -> None:
-        if self.key_pool.activate_global_cooldown(self.rate_limit_cooldown_seconds):
-            _provider_log(
-                f"TempMail.lol 触发 HTTP 429，所有邮箱创建线程暂停 "
-                f"{self.rate_limit_cooldown_seconds:.0f} 秒后自动恢复"
-            )
-
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        max_attempts = max(4, len(self.api_keys) * 2 + 2)
-        deadline = time.monotonic() + self.create_total_budget
-        backoff = 1.0
-        last_error: Exception | None = None
-        last_status: int | None = None
         selected_domain = _next_tempmail_domain(self.provider_ref, self.domains)
+        api_key = self.key_pool.next_key()
+        if api_key is None:
+            raise RuntimeError("TempMail.lol 没有可用 API Key")
+        payload: dict[str, Any] = {"prefix": username or _random_mailbox_name()}
+        if selected_domain:
+            payload["domain"] = selected_domain
+        try:
+            data = self._request("POST", "/inbox/create", api_key=api_key, payload=payload, expected=(200, 201))
+        except _TempMailLolRequestError as error:
+            status = f"HTTP {error.status_code}" if error.status_code is not None else "network"
+            raise RuntimeError(f"TempMail.lol 创建邮箱失败 ({status}): {error}") from error
 
-        for _attempt in range(1, max_attempts + 1):
-            # Server-side 429 cooldown is shared and does not consume the
-            # transient retry budget for this mailbox creation attempt.
-            deadline += self.key_pool.wait_for_global_cooldown()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            # Limit waits have their own budget, matching the checkin flow: a key
-            # can become available after the transient-request budget has elapsed.
-            api_key = self.key_pool.acquire(self.max_wait)
-            payload: dict[str, Any] = {"prefix": username or _random_mailbox_name()}
-            if selected_domain:
-                payload["domain"] = selected_domain
-
-            try:
-                data = self._request("POST", "/inbox/create", api_key=api_key, payload=payload, expected=(200, 201))
-            except _TempMailLolRequestError as error:
-                last_error = error
-                last_status = error.status_code
-                kind = _classify_tempmail_error(error)
-                if kind == "rate_limit":
-                    self.key_pool.mark_rate_limited(api_key)
-                    self._activate_rate_limit_cooldown()
-                    continue
-                if kind == "transient":
-                    time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
-                    backoff = min(backoff * 1.5, 8.0)
-                    continue
-                raise RuntimeError(f"TempMail.lol 创建失败 (HTTP {error.status_code}): {error}") from error
-
-            address = str(data.get("address") or "").strip()
-            token = str(data.get("token") or "").strip()
-            if not address or not token:
-                last_error = RuntimeError("TempMail.lol 响应缺少 address/token")
-                continue
-            _remember_tempmail_token_key(token, api_key)
-            return {
-                "provider": self.name,
-                "provider_ref": self.provider_ref,
-                "address": address,
-                "token": token,
-            }
-
-        raise RuntimeError(
-            f"TempMail.lol 创建邮箱多次失败 ({max_attempts} 次尝试，最后状态={last_status}): {last_error}"
-        )
+        address = str(data.get("address") or "").strip()
+        token = str(data.get("token") or "").strip()
+        if not address or not token:
+            raise RuntimeError("TempMail.lol 响应缺少 address/token")
+        _remember_tempmail_token_key(token, api_key)
+        return {
+            "provider": self.name,
+            "provider_ref": self.provider_ref,
+            "address": address,
+            "token": token,
+        }
 
     @staticmethod
     def _inbox_items(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1458,7 +1259,6 @@ class TempMailLolProvider(BaseMailProvider):
         boundary_filtered = 0
         no_code = 0
         rejected_codes = 0
-        cooldown_pauses = 0
         key_switches = 0
         last_batch = 0
         last_status: int | None = None
@@ -1471,23 +1271,10 @@ class TempMailLolProvider(BaseMailProvider):
                 f"http_429={http_429}, http_5xx={http_5xx}, other_errors={other_errors}, "
                 f"last_status={last_status if last_status is not None else 'none'}, last_batch={last_batch}, "
                 f"scanned={scanned}, no_code={no_code}, rejected_codes={rejected_codes}, "
-                f"boundary_filtered={boundary_filtered}, "
-                f"cooldown_pauses={cooldown_pauses}, key_switches={key_switches}"
+                f"boundary_filtered={boundary_filtered}, key_switches={key_switches}"
             )
 
         while time.monotonic() < deadline:
-            cooldown_remaining = self.key_pool.cooldown_remaining(api_key)
-            if cooldown_remaining > 0:
-                fallback = self.key_pool.available_key(exclude={api_key})
-                if fallback is not None:
-                    api_key = fallback
-                    key_switches += 1
-                    continue
-                pause = min(cooldown_remaining, max(0.0, deadline - time.monotonic()))
-                if pause > 0:
-                    cooldown_pauses += 1
-                    time.sleep(pause)
-                continue
             try:
                 data = self._request(
                     "GET",
@@ -1503,19 +1290,14 @@ class TempMailLolProvider(BaseMailProvider):
                 consecutive_errors += 1
                 if error.status_code == 429:
                     http_429 += 1
-                    self.key_pool.mark_rate_limited(api_key)
-                    self._activate_rate_limit_cooldown()
-                    fallback = self.key_pool.available_key(exclude={api_key})
-                    if fallback is not None:
-                        api_key = fallback
-                        key_switches += 1
-                    continue
+                    log_diagnostics("HTTP 429")
+                    raise RuntimeError("TempMail.lol 验证码查询失败: HTTP 429") from error
                 if error.status_code is not None and 500 <= error.status_code < 600:
                     http_5xx += 1
                 else:
                     other_errors += 1
                 if consecutive_errors == 3:
-                    fallback = self.key_pool.available_key(exclude={primary_key})
+                    fallback = self.key_pool.next_key(exclude={primary_key})
                     if fallback is not None:
                         api_key = fallback
                         key_switches += 1
@@ -2275,28 +2057,6 @@ def prepare_code_baseline(mail_config: dict, mailbox: dict) -> None:
         provider.close()
 
 
-def _is_account_creation_rate_limit(error: Exception | str | None) -> bool:
-    reason = str(error or "")
-    return "user_register_http_400" in reason and "account_creation_failed" in reason
-
-
-def mark_mailbox_rate_limited(mailbox: dict, *, reason: str = "", cooldown_seconds: float | None = None) -> bool:
-    if str(mailbox.get("provider") or "") != CloudflareTempMailProvider.name:
-        return False
-    key = str(mailbox.get("_rate_limit_cooldown_key") or "").strip()
-    if not key:
-        return False
-    try:
-        seconds = float(cooldown_seconds if cooldown_seconds is not None else mailbox.get("_rate_limit_cooldown_seconds") or 600)
-    except (TypeError, ValueError):
-        seconds = 600.0
-    activated = _activate_cloudflare_cooldown(key, seconds)
-    if activated:
-        label = f"{reason}，" if reason else ""
-        _provider_log(f"{label}按 HTTP 429 处理，CloudflareTempMail 所有线程暂停 {seconds:.0f} 秒后自动恢复")
-    return activated
-
-
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态。
 
@@ -2304,8 +2064,6 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     其余失败标记 failed（保留邮箱占用以便排查，可通过重置释放）。
     """
     reason = str(error or "").strip()
-    if not success and _is_account_creation_rate_limit(error):
-        mark_mailbox_rate_limited(mailbox, reason="OpenAI user_register account_creation_failed")
     if not success and "等待注册验证码超时" in reason:
         _mark_tempmail_verification_timeout(mailbox)
     if str(mailbox.get("provider") or "") != OutlookTokenProvider.name:

@@ -66,7 +66,7 @@ class TempMailLolProviderTests(unittest.TestCase):
         )
         self.assertEqual(mail_provider.parse_tempmail_domains(""), [])
 
-    def test_create_rotates_key_after_429_with_specified_domain(self) -> None:
+    def test_create_429_fails_fast_without_key_rotation_or_sleep(self) -> None:
         session = FakeSession(
             [
                 FakeResponse(429, {"error": "rate limited"}, "rate limited"),
@@ -78,80 +78,42 @@ class TempMailLolProviderTests(unittest.TestCase):
                 "provider_ref": "tempmail-test-429",
                 "api_key": "key-one\nkey-two",
                 "domain": ["abc12.example.com"],
-                "rate_per_window": 24,
-                "window_seconds": 300,
-                "rate_limit_cooldown_seconds": 600,
-                "max_wait": 0,
-                "create_total_budget": 15,
             },
             session,
         )
-        clock = [100.0]
-        sleeps: list[float] = []
         logs: list[str] = []
-
-        def fake_sleep(seconds: float) -> None:
-            sleeps.append(seconds)
-            clock[0] += seconds
-
         mail_provider.provider_log_sink = logs.append
         try:
-            with mock.patch.object(mail_provider.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
-                mail_provider.time, "sleep", side_effect=fake_sleep
+            with mock.patch.object(mail_provider.time, "sleep") as sleep, self.assertRaisesRegex(
+                RuntimeError, "HTTP 429"
             ):
-                mailbox = provider.create_mailbox()
+                provider.create_mailbox()
         finally:
             mail_provider.provider_log_sink = None
 
-        self.assertEqual(mailbox["token"], "token-429")
-        self.assertEqual(sleeps, [600.0])
-        self.assertEqual(sum("触发 HTTP 429" in item for item in logs), 1)
-        self.assertEqual(sum("冷却结束" in item for item in logs), 1)
+        sleep.assert_not_called()
+        self.assertFalse(logs)
         self.assertNotIn("key-one", "\n".join(logs))
         self.assertNotIn("token-429", "\n".join(logs))
-        self.assertEqual([request["headers"] for request in session.requests], [
-            {"Authorization": "Bearer key-one"},
-            {"Authorization": "Bearer key-two"},
-        ])
-        second_payload = session.requests[1]["json"]
-        self.assertIsInstance(second_payload, dict)
-        assert isinstance(second_payload, dict)
-        self.assertEqual(second_payload["domain"], "abc12.example.com")
-        self.assertTrue(re.fullmatch(r"[a-z]{5}\d{1,3}[a-z]{1,3}", str(second_payload["prefix"])))
+        self.assertEqual([request["headers"] for request in session.requests], [{"Authorization": "Bearer key-one"}])
+        payload = session.requests[0]["json"]
+        self.assertIsInstance(payload, dict)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["domain"], "abc12.example.com")
+        self.assertTrue(re.fullmatch(r"[a-z]{5}\d{1,3}[a-z]{1,3}", str(payload["prefix"])))
 
-    def test_429_cooldown_is_shared_by_provider_instances(self) -> None:
+    def test_key_rotation_is_shared_without_cooldown(self) -> None:
         entry = {
             "provider_ref": "tempmail-shared-429",
-            "api_key": "shared-key",
-            "window_seconds": 10,
-            "rate_limit_cooldown_seconds": 600,
+            "api_key": "key-one\nkey-two",
         }
         first = self.make_provider(entry, FakeSession([]))
         second = self.make_provider(entry, FakeSession([]))
-        clock = [50.0]
-        sleeps: list[float] = []
-        logs: list[str] = []
-
-        def fake_sleep(seconds: float) -> None:
-            sleeps.append(seconds)
-            clock[0] += seconds
-
-        mail_provider.provider_log_sink = logs.append
-        try:
-            with mock.patch.object(mail_provider.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
-                mail_provider.time, "sleep", side_effect=fake_sleep
-            ):
-                first._activate_rate_limit_cooldown()
-                second._activate_rate_limit_cooldown()
-                waited = second.key_pool.wait_for_global_cooldown()
-        finally:
-            mail_provider.provider_log_sink = None
 
         self.assertIs(first.key_pool, second.key_pool)
-        self.assertEqual(waited, 600.0)
-        self.assertEqual(sleeps, [600.0])
-        self.assertEqual(sum("触发 HTTP 429" in item for item in logs), 1)
-        self.assertEqual(sum("冷却结束" in item for item in logs), 1)
+        self.assertEqual(first.key_pool.next_key(), "key-one")
+        self.assertEqual(second.key_pool.next_key(), "key-two")
+        self.assertEqual(first.key_pool.next_key(), "key-one")
 
     def test_create_fails_fast_for_fatal_4xx(self) -> None:
         session = FakeSession([FakeResponse(403, {"error": "forbidden"}, "forbidden")])
@@ -165,11 +127,11 @@ class TempMailLolProviderTests(unittest.TestCase):
             session,
         )
 
-        with self.assertRaisesRegex(RuntimeError, r"创建失败 \(HTTP 403\)"):
+        with self.assertRaisesRegex(RuntimeError, r"创建邮箱失败 \(HTTP 403\)"):
             provider.create_mailbox()
         self.assertEqual(len(session.requests), 1)
 
-    def test_create_rotates_key_after_transient_network_error(self) -> None:
+    def test_create_network_error_fails_current_task_without_retry(self) -> None:
         session = FakeSession(
             [
                 OSError("temporary disconnect"),
@@ -186,13 +148,15 @@ class TempMailLolProviderTests(unittest.TestCase):
             session,
         )
 
-        with mock.patch.object(mail_provider.time, "sleep", return_value=None):
-            mailbox = provider.create_mailbox()
+        with mock.patch.object(mail_provider.time, "sleep") as sleep, self.assertRaisesRegex(
+            RuntimeError, "network"
+        ):
+            provider.create_mailbox()
 
-        self.assertEqual(mailbox["token"], "token-network")
+        sleep.assert_not_called()
         self.assertEqual(
             [request["headers"] for request in session.requests],
-            [{"Authorization": "Bearer key-one"}, {"Authorization": "Bearer key-two"}],
+            [{"Authorization": "Bearer key-one"}],
         )
 
     def test_configured_domain_is_sent_and_created_address_is_accepted(self) -> None:
@@ -253,12 +217,12 @@ class TempMailLolProviderTests(unittest.TestCase):
             ["one.example", "two.example"],
         )
 
-    def test_key_pool_enforces_sliding_window_limit(self) -> None:
-        pool = mail_provider._TempMailKeyPool(["only-key"], rate=1, window=300)
+    def test_key_pool_round_robins_without_sliding_window_limit(self) -> None:
+        pool = mail_provider._TempMailKeyPool(["key-one", "key-two"])
 
-        self.assertEqual(pool.acquire(0), "only-key")
-        with self.assertRaisesRegex(RuntimeError, "所有 API Key 均已达到限速"):
-            pool.acquire(0)
+        self.assertEqual(pool.next_key(), "key-one")
+        self.assertEqual(pool.next_key(), "key-two")
+        self.assertEqual(pool.next_key(), "key-one")
 
     def test_poll_uses_creation_key_then_switches_after_three_errors(self) -> None:
         entry = {
@@ -366,38 +330,30 @@ class TempMailLolProviderTests(unittest.TestCase):
 
         self.assertEqual(provider.wait_for_code(mailbox), "321654")
 
-    def test_poll_429_pauses_key_until_window_reset_without_leaking_secrets(self) -> None:
+    def test_poll_429_fails_fast_without_leaking_secrets(self) -> None:
         entry = {
             "provider_ref": "tempmail-poll-429",
             "api_key": "api-secret",
             "domain": [],
-            "window_seconds": 300,
         }
         session = FakeSession([FakeResponse(429, {"error": "rate limited"}, "rate limited")])
         provider = self.make_provider(entry, session)
         mailbox = {"address": "mail@example.com", "token": "token-secret"}
-        clock = [0.0]
-        sleeps: list[float] = []
         logs: list[str] = []
-
-        def fake_sleep(seconds: float) -> None:
-            sleeps.append(seconds)
-            clock[0] += seconds
-
         mail_provider.provider_log_sink = logs.append
         try:
-            with mock.patch.object(mail_provider.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
-                mail_provider.time, "sleep", side_effect=fake_sleep
+            with mock.patch.object(mail_provider.time, "sleep") as sleep, self.assertRaisesRegex(
+                RuntimeError, "HTTP 429"
             ):
-                self.assertIsNone(provider.wait_for_code(mailbox))
+                provider.wait_for_code(mailbox)
         finally:
             mail_provider.provider_log_sink = None
 
         self.assertEqual(len(session.requests), 1)
-        self.assertEqual(sleeps, [2.0])
+        sleep.assert_not_called()
         summary = "\n".join(logs)
         self.assertIn("http_429=1", summary)
-        self.assertIn("cooldown_pauses=1", summary)
+        self.assertNotIn("cooldown", summary)
         self.assertNotIn("api-secret", summary)
         self.assertNotIn("token-secret", summary)
 

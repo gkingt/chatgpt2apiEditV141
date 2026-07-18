@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from services.account_service import account_service
@@ -14,14 +14,6 @@ from services.register import mail_provider, openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
-
-
-def _immediate_backoff_reason(error: object) -> str:
-    text = str(error or "").lower()
-    if any(marker in text for marker in ("http 429", "http_429", "status=429", "status_code=429")):
-        return "rate_limit"
-    return ""
-
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
     return "\n".join(
@@ -50,7 +42,6 @@ def _default_config() -> dict:
         "target_quota": 100,
         "target_available": 10,
         "check_interval": 5,
-        "failure_backoff_seconds": 1200,
         "enabled": False,
         "stats": {
             "success": 0,
@@ -94,7 +85,7 @@ def _normalize(raw: dict) -> dict:
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
     cfg.pop("failure_backoff_threshold", None)
-    cfg["failure_backoff_seconds"] = max(1, int(cfg.get("failure_backoff_seconds") or 1200))
+    cfg.pop("failure_backoff_seconds", None)
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
     mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
@@ -108,8 +99,18 @@ def _normalize(raw: dict) -> dict:
                 provider.pop("domain_stats", None)
                 if provider.get("type") == "tempmail_lol":
                     provider["domain"] = mail_provider.parse_tempmail_domains(provider.get("domain"))
-                    provider.pop("domain_cooldown_threshold", None)
-                    provider.pop("domain_cooldown_seconds", None)
+                    for key in (
+                        "domain_cooldown_threshold",
+                        "domain_cooldown_seconds",
+                        "rate_per_window",
+                        "window_seconds",
+                        "rate_limit_cooldown_seconds",
+                        "max_wait",
+                        "create_total_budget",
+                    ):
+                        provider.pop(key, None)
+                elif provider.get("type") == "cloudflare_temp_email":
+                    provider.pop("rate_limit_cooldown_seconds", None)
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
@@ -246,12 +247,12 @@ class RegisterService:
 
     def start(self, updates: dict | None = None) -> dict:
         with self._lock:
+            if updates:
+                self._apply_updates_locked(updates)
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
                 return self.get()
-            if updates:
-                self._apply_updates_locked(updates)
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
@@ -393,21 +394,6 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
-    def _wait_for_retry(self, seconds: int, reason: str) -> bool:
-        delay = max(1, int(seconds))
-        deadline = time.monotonic() + delay
-        retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
-        self._bump(retry_at=retry_at, pause_reason=reason, running=0)
-        while self._is_enabled():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._bump(retry_at=None, pause_reason="", consecutive_failures=0)
-                self._append_log("失败冷却结束，注册调度自动恢复", "yellow")
-                return True
-            time.sleep(min(1.0, remaining))
-        self._bump(retry_at=None, pause_reason="", running=0)
-        return False
-
     def _run_loop(self) -> None:
         threads = int(self.get()["threads"])
         initial_stats = self.get().get("stats") or {}
@@ -415,7 +401,6 @@ class RegisterService:
         success = int(initial_stats.get("success") or 0)
         fail = int(initial_stats.get("fail") or 0)
         consecutive_failures = int(initial_stats.get("consecutive_failures") or 0)
-        immediate_pause_reason = ""
         task_index = done
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
@@ -423,7 +408,6 @@ class RegisterService:
                 cfg = self.get()
                 while (
                     self._is_enabled()
-                    and not immediate_pause_reason
                     and len(futures) < threads
                     and not self._target_reached(cfg, success, len(futures))
                 ):
@@ -441,17 +425,6 @@ class RegisterService:
                         break
                     if str(cfg.get("mode") or "total") == "total" and self._target_reached(cfg, success):
                         break
-                    if immediate_pause_reason:
-                        delay = max(1, int(cfg.get("failure_backoff_seconds") or 1200))
-                        self._append_log(
-                            f"检测到 HTTP 429/明确限流，暂停新注册 {delay} 秒；冷却后自动恢复",
-                            "yellow",
-                        )
-                        if not self._wait_for_retry(delay, immediate_pause_reason):
-                            break
-                        consecutive_failures = 0
-                        immediate_pause_reason = ""
-                        continue
                     time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
                 finished, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -460,10 +433,8 @@ class RegisterService:
                     try:
                         result = future.result()
                         ok = bool(isinstance(result, dict) and result.get("ok"))
-                        failure_error = str(result.get("error") or "") if isinstance(result, dict) else ""
                     except Exception as error:
                         ok = False
-                        failure_error = str(error)
                         self._append_log(
                             f"注册工作线程异常（{type(error).__name__}），已计为失败并继续调度",
                             "red",
@@ -471,13 +442,9 @@ class RegisterService:
                     if ok:
                         success += 1
                         consecutive_failures = 0
-                        immediate_pause_reason = ""
                     else:
                         fail += 1
                         consecutive_failures += 1
-                        reason = _immediate_backoff_reason(failure_error)
-                        if reason:
-                            immediate_pause_reason = reason
                 self._bump(
                     running=len(futures),
                     done=done,
