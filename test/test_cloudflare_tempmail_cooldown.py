@@ -115,6 +115,7 @@ class CloudflareTempMailNoCooldownTests(unittest.TestCase):
             "admin_password": "secret",
             "domain": ["example.test"],
             "subdomain_levels": ["sfsfe", "grtwrwe"],
+            "append_random_suffix": False,
         }
         conf = {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "user_agent": "test", "proxy": ""}
         with mock.patch.object(mail_provider, "_create_session", return_value=session):
@@ -122,6 +123,30 @@ class CloudflareTempMailNoCooldownTests(unittest.TestCase):
             provider.create_mailbox("user")
 
         self.assertEqual(session.calls[0]["json"]["domain"], "grtwrwe.sfsfe.example.test")
+
+    def test_manual_levels_append_distinct_random_suffixes_by_default(self):
+        session = FakeSession([FakeResponse(200, {"address": "user@grtwrwed3e4f.sfsfea1b2c.example.test", "jwt": "mail-token"})])
+        entry = {
+            "provider_ref": "cloudflare-test",
+            "api_base": "https://mail.example.test",
+            "admin_password": "secret",
+            "domain": ["example.test"],
+            "subdomain_levels": ["sfsfe", "grtwrwe"],
+        }
+        conf = {"request_timeout": 30, "wait_timeout": 30, "wait_interval": 2, "user_agent": "test", "proxy": ""}
+        with (
+            mock.patch.object(mail_provider, "_create_session", return_value=session),
+            mock.patch.object(mail_provider, "_random_subdomain_suffix", side_effect=["a1b2c", "d3e4f"]),
+        ):
+            provider = mail_provider.CloudflareTempMailProvider(entry, conf)
+            provider.create_mailbox("user")
+
+        self.assertEqual(session.calls[0]["json"]["domain"], "grtwrwed3e4f.sfsfea1b2c.example.test")
+
+    def test_random_subdomain_suffix_has_five_mixed_characters(self):
+        for _ in range(25):
+            suffix = mail_provider._random_subdomain_suffix()
+            self.assertRegex(suffix, r"^(?=.*[a-z])(?=.*\d)[a-z0-9]{5}$")
 
     def test_manual_level_rejects_dot_separated_value(self):
         session = FakeSession([])

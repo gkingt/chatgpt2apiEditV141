@@ -240,6 +240,13 @@ def _random_subdomain_label() -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(4, 10)))
 
 
+def _random_subdomain_suffix() -> str:
+    chars = [random.choice(string.ascii_lowercase), random.choice(string.digits)]
+    chars.extend(random.choices(string.ascii_lowercase + string.digits, k=3))
+    random.shuffle(chars)
+    return "".join(chars)
+
+
 def _next_domain(domains: list[str]) -> str:
     global domain_index
     domains = [str(item).strip() for item in domains if str(item).strip()]
@@ -540,6 +547,11 @@ class CloudflareTempMailProvider(BaseMailProvider):
         self.domain = _normalize_string_list(entry.get("domain"))
         self.subdomain = _normalize_string_list(entry.get("subdomain"))
         self.subdomain_levels = _normalize_string_list(entry.get("subdomain_levels"))
+        suffix_value = entry.get("append_random_suffix", True)
+        if isinstance(suffix_value, bool):
+            self.append_random_suffix = suffix_value
+        else:
+            self.append_random_suffix = str(suffix_value).strip().lower() not in {"0", "false", "no", "off"}
         try:
             depth = int(entry.get("random_subdomain_depth") or 1)
         except (TypeError, ValueError):
@@ -568,6 +580,14 @@ class CloudflareTempMailProvider(BaseMailProvider):
             ]
             if any("." in level for level in levels):
                 raise RuntimeError("CloudflareTempMail 手动域名每一级只能填写一个标签，不能包含点号")
+            if self.append_random_suffix:
+                levels = [
+                    _normalize_dns_name(
+                        f"{level}{_random_subdomain_suffix()}",
+                        f"CloudflareTempMail 第 {index} 级域名（含随机后缀）",
+                    )
+                    for index, level in enumerate(levels, start=1)
+                ]
             return f"{'.'.join(reversed(levels))}.{base_domain}"
         if self.subdomain:
             custom = _normalize_dns_name(random.choice(self.subdomain), "CloudflareTempMail N 级域名")

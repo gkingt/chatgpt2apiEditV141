@@ -101,7 +101,7 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
       type,
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
-      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [], subdomain: [], subdomain_levels: [], random_subdomain_depth: 1 } : {}),
+      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [], subdomain: [], subdomain_levels: [], append_random_suffix: true, random_subdomain_depth: 1 } : {}),
       ...(type === "tempmail_lol" ? { api_key: "", domain: [] } : {}),
       ...(type === "moemail" ? { api_base: "", api_key: "", domain: [] } : {}),
       ...(type === "inbucket" ? { api_base: "", domain: [], random_subdomain: true } : {}),
@@ -231,8 +231,14 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
                 const legacyPrefix = subdomains.split(/\r?\n/).map((item) => item.trim()).find(Boolean) || "";
                 const cloudflareLevels = savedLevels.length ? savedLevels : legacyPrefix ? legacyPrefix.split(".").reverse() : [""];
                 const hasManualLevels = cloudflareLevels.some((value) => value.trim().length > 0);
+                const appendRandomSuffix = provider.append_random_suffix !== false;
                 const rootDomainPreview = domains.split(/\r?\n/).map((item) => item.trim()).find(Boolean) || "example.com";
-                const manualPrefixPreview = cloudflareLevels.map((item) => item.trim()).filter(Boolean).reverse().join(".");
+                const manualPrefixPreview = cloudflareLevels
+                  .map((item) => item.trim())
+                  .filter(Boolean)
+                  .map((item) => appendRandomSuffix ? `${item}a1b2c` : item)
+                  .reverse()
+                  .join(".");
                 const domainPreview = manualPrefixPreview ? `${manualPrefixPreview}.${rootDomainPreview}` : `随机前缀.${rootDomainPreview}`;
                 const domainStats = Array.isArray(provider.domain_stats) ? provider.domain_stats as Array<Record<string, unknown>> : [];
                 return (
@@ -496,6 +502,17 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
                             </div>
                           ))}
                         </div>
+                        <label className="flex items-start gap-3 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2.5 text-sm text-stone-700">
+                          <Checkbox
+                            checked={appendRandomSuffix}
+                            onCheckedChange={(checked) => updateProvider(index, { append_random_suffix: Boolean(checked) })}
+                            disabled={config.enabled}
+                          />
+                          <span className="space-y-1">
+                            <span className="block font-medium text-stone-800">每一级追加 5 位随机后缀</span>
+                            <span className="block text-xs leading-5 text-stone-500">默认开启；每次创建邮箱时，为所有手动层级分别追加包含小写字母和数字的随机串。</span>
+                          </span>
+                        </label>
                         <div className="grid gap-4 border-t border-stone-100 pt-3 md:grid-cols-[160px_minmax(0,1fr)]">
                           <div className="space-y-2">
                             <label className="text-sm text-stone-700">随机层级</label>
@@ -512,7 +529,7 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
                           <div className="rounded-lg bg-stone-50 px-3 py-2.5">
                             <div className="text-xs text-stone-400">最终域名预览</div>
                             <div className="mt-1 break-all font-mono text-sm font-semibold text-stone-800">{domainPreview}</div>
-                            {hasManualLevels ? <p className="mt-1 text-xs text-stone-500">示例：第1级 sfsfe、第2级 grtwrwe → grtwrwe.sfsfe.{rootDomainPreview}</p> : <p className="mt-1 text-xs text-stone-500">当前使用随机 {Number(provider.random_subdomain_depth || 1)} 级域名。</p>}
+                            {hasManualLevels ? <p className="mt-1 text-xs text-stone-500">示例：第1级 sfsfe、第2级 grtwrwe → {appendRandomSuffix ? `grtwrwea1b2c.sfsfea1b2c.${rootDomainPreview}` : `grtwrwe.sfsfe.${rootDomainPreview}`}</p> : <p className="mt-1 text-xs text-stone-500">当前使用随机 {Number(provider.random_subdomain_depth || 1)} 级域名。</p>}
                           </div>
                         </div>
                       </div>

@@ -58,6 +58,28 @@ class RegisterConcurrencyTests(unittest.TestCase):
         self.assertNotIn("max_wait", provider)
         self.assertNotIn("create_total_budget", provider)
 
+    def test_normalize_enables_cloudflare_manual_level_suffix_by_default(self) -> None:
+        config = register_service_module._normalize(
+            {
+                "mail": {
+                    "providers": [
+                        {
+                            "type": "cloudflare_temp_email",
+                            "enable": True,
+                            "subdomain_levels": ["sfsfe", "grtwrwe"],
+                        }
+                    ]
+                }
+            }
+        )
+
+        provider = config["mail"]["providers"][0]
+        self.assertIs(provider["append_random_suffix"], True)
+
+        config["mail"]["providers"][0]["append_random_suffix"] = False
+        normalized = register_service_module._normalize(config)
+        self.assertIs(normalized["mail"]["providers"][0]["append_random_suffix"], False)
+
     def test_normalize_clears_stale_runtime_state_when_disabled(self) -> None:
         config = register_service_module._normalize(
             {
