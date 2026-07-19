@@ -108,26 +108,52 @@ class ReferenceRegisterTests(unittest.TestCase):
         self.assertNotIn("openai-sentinel-token", headers)
         self.assertNotIn("traceparent", headers)
 
-    def test_passwordless_login_failed_requests_one_fresh_code_before_retrying(self) -> None:
+    def test_passwordless_login_failed_does_not_loop_resend_in_same_broken_session(self) -> None:
         registrar = reference_register.ReferencePlatformRegistrar("")
         registrar.signup_verification_mode = "passwordless_signup"
         rejected = mock.Mock(status_code=401, text='{"error":{"code":"login_failed"}}')
         rejected.json.return_value = {"error": {"code": "login_failed"}}
-        accepted = mock.Mock(status_code=200, text="")
-        accepted.json.return_value = {}
         mailbox = {"address": "user@example.test"}
 
         with (
-            mock.patch.object(openai_register, "wait_for_code", side_effect=["111111", "222222"]),
-            mock.patch.object(registrar, "_request_otp_validation", side_effect=[(rejected, ""), (accepted, "")]) as validate,
+            mock.patch.object(openai_register, "wait_for_code", return_value="111111"),
+            mock.patch.object(registrar, "_request_otp_validation", return_value=(rejected, "")) as validate,
             mock.patch.object(registrar, "_resend_signup_otp") as resend,
-            mock.patch.object(openai_register.time, "sleep", return_value=None),
         ):
-            registrar._validate_mailbox_otp(mailbox, 4)
+            with self.assertRaisesRegex(RuntimeError, "validate_otp_http_401"):
+                registrar._validate_mailbox_otp(mailbox, 4)
 
         registrar.close()
-        self.assertEqual(validate.call_count, 2)
-        resend.assert_called_once_with(4, mailbox)
+        validate.assert_called_once_with("111111", 4)
+        resend.assert_not_called()
+
+    def test_authorize_landing_on_email_verification_skips_duplicate_email_submission(self) -> None:
+        mailbox = {"address": "user@example.test", "provider": "test"}
+        registrar = reference_register.ReferencePlatformRegistrar("")
+
+        def land_on_verification(*_args, **_kwargs):
+            registrar.chatgpt_authorize_landed_path = "/email-verification"
+
+        with (
+            mock.patch.object(openai_register, "create_mailbox", return_value=mailbox),
+            mock.patch.object(openai_register.mail_provider, "mark_mailbox_result"),
+            mock.patch.object(openai_register.mail_provider, "prepare_code_baseline"),
+            mock.patch.object(registrar, "_chatgpt_authorize", side_effect=land_on_verification),
+            mock.patch.object(registrar, "_authorize_signup") as signup,
+            mock.patch.object(registrar, "_resend_signup_otp") as resend,
+            mock.patch.object(registrar, "_validate_mailbox_otp"),
+            mock.patch.object(registrar, "_create_account"),
+            mock.patch.object(
+                registrar,
+                "_finish_chatgpt_registration",
+                return_value={"access_token": "chatgpt-token", "session_token": "", "cookie": ""},
+            ),
+        ):
+            registrar.register(5)
+
+        registrar.close()
+        signup.assert_not_called()
+        resend.assert_not_called()
 
     def test_random_profile_is_used_for_sentinel_generation(self) -> None:
         registrar = reference_register.ReferencePlatformRegistrar("")

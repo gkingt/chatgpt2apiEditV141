@@ -142,11 +142,6 @@ class ReferencePlatformRegistrar(openai_register.PlatformRegistrar):
             response, error = submit()
         return response, error
 
-    def _otp_validation_retryable(self, error_code: str) -> bool:
-        return super()._otp_validation_retryable(error_code) or (
-            self.signup_verification_mode == "passwordless_signup" and error_code == "login_failed"
-        )
-
     def _send_email_otp_reference(self, index: int, mailbox: dict[str, Any]) -> None:
         self._ensure_active()
         self._prepare_reference_code_baseline(index, mailbox, "发送验证码前")
@@ -210,11 +205,19 @@ class ReferencePlatformRegistrar(openai_register.PlatformRegistrar):
                 f"新注册：设备画像={'mobile' if self._is_mobile else 'desktop'}",
             )
             self._chatgpt_authorize(email, index, include_login_hint=True)
-            mode, verification_mode = self._authorize_signup(
-                email,
-                index,
-                screen_hint="login_or_signup",
-            )
+            if self.chatgpt_authorize_landed_path == "/email-verification":
+                mode, verification_mode = "otp", "passwordless_signup"
+                self.signup_verification_mode = verification_mode
+                openai_register.step(index, "新注册：authorize 已进入验证码页，不重复提交邮箱")
+            elif self.chatgpt_authorize_landed_path == "/create-account/password":
+                mode, verification_mode = "password", ""
+                openai_register.step(index, "新注册：authorize 已进入密码页，不重复提交邮箱")
+            else:
+                mode, verification_mode = self._authorize_signup(
+                    email,
+                    index,
+                    screen_hint="login_or_signup",
+                )
             password = ""
             if mode == "password":
                 password = openai_register._random_password()

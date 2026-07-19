@@ -497,6 +497,7 @@ class PlatformRegistrar:
         self.code_verifier = ""
         self.platform_auth_code = ""
         self.chatgpt_callback_url = ""
+        self.chatgpt_authorize_landed_path = ""
         self.authorize_sentinel_token = ""
         self.password_sentinel_token = ""
         self.signup_verification_mode = ""
@@ -717,6 +718,7 @@ class PlatformRegistrar:
             resp, error = authorize()
         if resp is None or resp.status_code != 200:
             raise RuntimeError(error or f"chatgpt_authorize_http_{getattr(resp, 'status_code', 'unknown')}")
+        self.chatgpt_authorize_landed_path = _url_path(str(getattr(resp, "url", "") or ""))
         parsed_authorize = urlparse(authorize_url)
         try:
             cookie_device_id = str(self.session.cookies.get("oai-did", "") or "").strip()
@@ -1083,6 +1085,13 @@ class PlatformRegistrar:
     def _otp_validation_retryable(self, error_code: str) -> bool:
         return error_code in {"wrong_email_otp_code", "email_otp_invalid", "invalid_code"}
 
+    def _prepare_signup_code_baseline(self, mailbox: dict[str, Any], index: int) -> None:
+        try:
+            mail_provider.prepare_code_baseline(_mail_config(self.proxy), mailbox)
+            step(index, "提交注册邮箱前邮箱基线已记录")
+        except Exception as exc:
+            step(index, f"邮箱基线记录失败，继续提交注册邮箱: {str(exc)[:160]}", "yellow")
+
     def _retry_signup_otp_delivery(self, mailbox: dict[str, Any], index: int, reason: str) -> None:
         """Request a fresh OTP between polling windows without hiding hard rate limits."""
         try:
@@ -1198,6 +1207,7 @@ class PlatformRegistrar:
             self._ensure_active()
             self._chatgpt_authorize(email, index)
             self._ensure_active()
+            self._prepare_signup_code_baseline(mailbox, index)
             signup_mode, verification_mode = self._authorize_signup(email, index)
             if signup_mode == "password":
                 password = _random_password()
@@ -1213,7 +1223,7 @@ class PlatformRegistrar:
                         "signup_otp_mode_unconfirmed: "
                         f"email_verification_mode={verification_mode or 'unknown'}"
                     )
-                self._resend_signup_otp(index, mailbox)
+                step(index, "提交邮箱已触发验证码，直接等待首封邮件")
             self._validate_mailbox_otp(mailbox, index)
             self._ensure_active()
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)

@@ -274,7 +274,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         self.assertEqual(result["access_token"], "chatgpt-token")
         mark_result.assert_called_once_with(mailbox, success=True)
 
-    def test_register_direct_otp_state_uses_resend_and_existing_mailbox_pipeline(self):
+    def test_register_direct_otp_state_waits_for_first_code_without_resend(self):
         fake_proxy = FakeProxySettings()
         mailbox = {"address": "user@example.com", "label": "test", "provider": "test"}
         with patch.object(openai_register, "proxy_settings", fake_proxy), patch.object(
@@ -299,7 +299,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
 
         registrar._register_user.assert_not_called()
         registrar._send_otp.assert_not_called()
-        registrar._resend_signup_otp.assert_called_once_with(1, mailbox)
+        registrar._resend_signup_otp.assert_not_called()
         registrar._validate_mailbox_otp.assert_called_once_with(mailbox, 1)
         self.assertEqual(result["password"], "")
         self.assertEqual(result["access_token"], "chatgpt-token")
