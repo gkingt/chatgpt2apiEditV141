@@ -112,6 +112,11 @@ def _normalize(raw: dict) -> dict:
                         provider.pop(key, None)
                 elif provider.get("type") == "cloudflare_temp_email":
                     provider.pop("rate_limit_cooldown_seconds", None)
+                    try:
+                        depth = int(provider.get("random_subdomain_depth") or 1)
+                    except (TypeError, ValueError):
+                        depth = 1
+                    provider["random_subdomain_depth"] = max(1, min(5, depth))
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}

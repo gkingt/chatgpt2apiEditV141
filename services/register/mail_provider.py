@@ -260,6 +260,24 @@ def _normalize_string_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+def _normalize_dns_name(value: Any, field: str) -> str:
+    name = str(value or "").strip().lower().lstrip("@").strip(".")
+    if not name:
+        raise RuntimeError(f"{field} 不能为空")
+    try:
+        ascii_name = name.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise RuntimeError(f"{field} 格式无效: {name}") from error
+    labels = ascii_name.split(".")
+    if len(ascii_name) > 253 or any(
+        len(label) > 63
+        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    ):
+        raise RuntimeError(f"{field} 格式无效: {name}")
+    return ascii_name
+
+
 def _create_session(conf: dict):
     proxy = str(conf.get("proxy") or "").strip()
     kwargs = {"impersonate": "chrome", "verify": False}
@@ -519,7 +537,13 @@ class CloudflareTempMailProvider(BaseMailProvider):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
         self.api_base = str(entry["api_base"]).rstrip("/")
         self.admin_password = str(entry["admin_password"]).strip()
-        self.domain = entry.get("domain") or []
+        self.domain = _normalize_string_list(entry.get("domain"))
+        self.subdomain = _normalize_string_list(entry.get("subdomain"))
+        try:
+            depth = int(entry.get("random_subdomain_depth") or 1)
+        except (TypeError, ValueError):
+            depth = 1
+        self.random_subdomain_depth = max(1, min(5, depth))
         self._last_status_code: int | None = None
         self._last_raw_batch = 0
         self._last_matched_batch = 0
@@ -534,8 +558,28 @@ class CloudflareTempMailProvider(BaseMailProvider):
             raise RuntimeError(f"CloudflareTempMail 请求失败: {method} {path}, HTTP {resp.status_code}, body={resp.text[:300]}")
         return {} if resp.status_code == 204 else resp.json()
 
+    def _resolve_domain(self) -> str:
+        base_domain = _normalize_dns_name(_next_domain(self.domain), "CloudflareTempMail 根域名")
+        if self.subdomain:
+            custom = _normalize_dns_name(random.choice(self.subdomain), "CloudflareTempMail N 级域名")
+            if custom == base_domain or custom.endswith(f".{base_domain}"):
+                return custom
+            return f"{custom}.{base_domain}"
+        prefix = ".".join(_random_subdomain_label() for _ in range(self.random_subdomain_depth))
+        return f"{prefix}.{base_domain}"
+
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
-        data = self._request("POST", "/admin/new_address", headers={"x-admin-auth": self.admin_password}, payload={"enablePrefix": True, "name": username or _random_mailbox_name(), "domain": _next_domain(self.domain)})
+        selected_domain = self._resolve_domain()
+        data = self._request(
+            "POST",
+            "/admin/new_address",
+            headers={"x-admin-auth": self.admin_password},
+            payload={
+                "enablePrefix": True,
+                "name": username or _random_mailbox_name(),
+                "domain": selected_domain,
+            },
+        )
         address = str(data.get("address") or "").strip()
         token = str(data.get("jwt") or "").strip()
         if not address or not token:

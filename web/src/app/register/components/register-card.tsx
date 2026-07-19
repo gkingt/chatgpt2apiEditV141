@@ -101,7 +101,7 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
       type,
       enable: true,
       ...(type === "cloudmail_gen" ? { api_base: "", admin_email: "", admin_password: "", domain: [], subdomain: [], email_prefix: "" } : {}),
-      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [] } : {}),
+      ...(type === "cloudflare_temp_email" ? { api_base: "", admin_password: "", domain: [], subdomain: [], random_subdomain_depth: 1 } : {}),
       ...(type === "tempmail_lol" ? { api_key: "", domain: [] } : {}),
       ...(type === "moemail" ? { api_base: "", api_key: "", domain: [] } : {}),
       ...(type === "inbucket" ? { api_base: "", domain: [], random_subdomain: true } : {}),
@@ -226,7 +226,7 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
               {providers.map((provider, index) => {
                 const type = String(provider.type || "tempmail_lol");
                 const domains = Array.isArray(provider.domain) ? provider.domain.map(String).join("\n") : "";
-                const subdomains = Array.isArray(provider.subdomain) ? provider.subdomain.map(String).join("\n") : "";
+                const subdomains = Array.isArray(provider.subdomain) ? provider.subdomain.map(String).join("\n") : String(provider.subdomain || "");
                 const domainStats = Array.isArray(provider.domain_stats) ? provider.domain_stats as Array<Record<string, unknown>> : [];
                 return (
                   <div key={index} className="space-y-3 border-t border-stone-200 pt-3 first:border-t-0 first:pt-0">
@@ -426,8 +426,8 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
 
                     {type === "cloudmail_gen" || type === "cloudflare_temp_email" || type === "tempmail_lol" || type === "moemail" || type === "inbucket" || type === "yyds_mail" || type === "ddg_mail" ? (
                       <div className="space-y-2">
-                        <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "tempmail_lol" ? "指定域名（可选）" : type === "inbucket" ? "基础域名列表" : "Domain"}</label>
-                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "tempmail_lol" ? "每行一个域名；留空时不指定，由 TempMail.lol 自动分配" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
+                        <label className="text-sm text-stone-700">{type === "cloudmail_gen" ? "邮箱域名" : type === "cloudflare_temp_email" ? "根域名" : type === "tempmail_lol" ? "指定域名（可选）" : type === "inbucket" ? "基础域名列表" : "Domain"}</label>
+                        <Textarea value={domains} onChange={(event) => updateProvider(index, { domain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder={type === "cloudmail_gen" ? "每行一个域名，留空则使用服务默认域名" : type === "cloudflare_temp_email" ? "每行一个根域名，例如 example.com" : type === "tempmail_lol" ? "每行一个域名；留空时不指定，由 TempMail.lol 自动分配" : type === "inbucket" ? "每行一个基础域名，系统会自动生成随机子域名" : type === "moemail" ? "每行一个域名" : "每行一个域名，留空则使用服务默认域名"} className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
                         {type === "tempmail_lol" ? <p className="text-xs leading-5 text-stone-500">配置多个域名时按顺序轮换；留空不会向创建接口发送 domain。</p> : null}
                       </div>
                     ) : null}
@@ -435,6 +435,34 @@ export function RegisterCard({ newRegister, onNewRegisterChange }: RegisterCardP
                       <div className="space-y-2">
                         <label className="text-sm text-stone-700">子域名（支持多个）</label>
                         <Textarea value={subdomains} onChange={(event) => updateProvider(index, { subdomain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })} placeholder="每行一个子域名前缀，留空则直接使用主域名" className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs" disabled={config.enabled} />
+                      </div>
+                    ) : null}
+                    {type === "cloudflare_temp_email" ? (
+                      <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_160px]">
+                        <div className="space-y-2">
+                          <label className="text-sm text-stone-700">N 级域名（可选）</label>
+                          <Textarea
+                            value={subdomains}
+                            onChange={(event) => updateProvider(index, { subdomain: event.target.value.split(/[\n,]/).map((item) => item.trim()) })}
+                            placeholder={"支持 mail、team.mail 或完整域名\n可填写多个，每行一个；留空默认随机"}
+                            className="min-h-20 rounded-xl border-stone-200 bg-white font-mono text-xs"
+                            disabled={config.enabled}
+                          />
+                          <p className="text-xs leading-5 text-stone-500">填写后从候选中随机选取；未填写时自动生成随机 N 级域名。</p>
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-sm text-stone-700">随机层级</label>
+                          <Input
+                            type="number"
+                            min={1}
+                            max={5}
+                            value={String(provider.random_subdomain_depth || 1)}
+                            onChange={(event) => updateProvider(index, { random_subdomain_depth: Math.max(1, Math.min(5, Number(event.target.value) || 1)) })}
+                            className="h-10 rounded-xl border-stone-200 bg-white"
+                            disabled={config.enabled || subdomains.trim().length > 0}
+                          />
+                          <p className="text-xs leading-5 text-stone-500">仅在自定义留空时生效，范围 1-5。</p>
+                        </div>
                       </div>
                     ) : null}
                   </div>
