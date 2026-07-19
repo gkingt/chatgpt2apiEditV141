@@ -79,7 +79,7 @@ class AccountEnvironmentTests(unittest.TestCase):
             self.assertEqual(service.ensure_account_fp("legacy-token", second)["oai-device-id"], "first-device")
             self.assertEqual(service.get_account("legacy-token")["fp"]["oai-device-id"], "first-device")
 
-    def test_backend_reuses_saved_fingerprint_proxy_and_cookies(self) -> None:
+    def test_backend_reuses_saved_fingerprint_and_proxy_without_request_cookies(self) -> None:
         account = {
             "access_token": "token",
             "proxy": "http://registered-proxy:8080",
@@ -105,7 +105,7 @@ class AccountEnvironmentTests(unittest.TestCase):
         self.assertEqual(backend.session_id, "registered-session")
         self.assertEqual(session.headers["User-Agent"], "Registered Browser/1.0")
         self.assertEqual(session.headers["Sec-Ch-Ua-Platform"], '"Android"')
-        self.assertIn(("session", "registered-cookie", ".chatgpt.com"), session.cookies.values)
+        self.assertEqual(session.cookies.values, [])
         backend.close()
 
     def test_legacy_account_fingerprint_is_persisted_once(self) -> None:

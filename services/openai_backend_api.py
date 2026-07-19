@@ -203,7 +203,6 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
-        self._restore_account_cookies()
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -272,19 +271,6 @@ class OpenAIBackendAPI:
         fp.setdefault("sec-ch-ua-platform", '"Windows"')
         fp.setdefault("sec-ch-ua-platform-version", '"19.0.0"')
         return fp
-
-    def _restore_account_cookies(self) -> None:
-        cookie_header = str(self.account.get("cookie") or "").strip()
-        if not cookie_header:
-            return
-        for part in cookie_header.split(";"):
-            name, separator, value = part.strip().partition("=")
-            if not separator or not name:
-                continue
-            try:
-                self.session.cookies.set(name, value, domain=".chatgpt.com")
-            except Exception:
-                continue
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
