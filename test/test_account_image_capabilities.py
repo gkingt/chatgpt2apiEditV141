@@ -5,7 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 
@@ -33,26 +33,40 @@ class AccountCapabilityTests(unittest.TestCase):
         fetch.assert_called_once_with("test-token", "refresh_accounts", True)
         self.assertEqual(result["refreshed"], 1)
 
-    def test_user_info_requests_stay_on_the_session_owner_thread(self) -> None:
+    def test_user_info_requests_use_sessions_owned_by_each_worker(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "test-token"
-        owner_thread = threading.get_ident()
-        calls: list[tuple[str, int]] = []
+        backend._session_kwargs = {}
+        backend.session = MagicMock()
+        backend.session.headers = {}
+        backend.session.cookies.get_dict.return_value = {}
+        calls: list[tuple[str, int, object]] = []
+        closed: list[tuple[int, object]] = []
 
         def record(name: str, result: dict):
-            def run() -> dict:
-                calls.append((name, threading.get_ident()))
+            def run(session) -> dict:
+                calls.append((name, threading.get_ident(), session))
                 return result
             return run
+
+        def create_session(**_kwargs):
+            session = MagicMock()
+            session.headers = {}
+            session.cookies = MagicMock()
+            session.close.side_effect = lambda: closed.append((threading.get_ident(), session))
+            return session
 
         backend._get_me = record("me", {"email": "pool@example.com", "id": "user-1"})
         backend._get_conversation_init = record("init", {"limits_progress": [], "default_model_slug": "auto"})
         backend._get_default_account = record("account", {"plan_type": "free"})
 
-        result = backend.get_user_info()
+        with patch("services.openai_backend_api.requests.Session", side_effect=create_session):
+            result = backend.get_user_info()
 
-        self.assertEqual([name for name, _ in calls], ["me", "init", "account"])
-        self.assertTrue(all(thread_id == owner_thread for _, thread_id in calls))
+        self.assertEqual({name for name, _, _ in calls}, {"me", "init", "account"})
+        self.assertEqual({id(session) for _, _, session in calls}, {id(session) for _, session in closed})
+        close_threads = {id(session): thread_id for thread_id, session in closed}
+        self.assertTrue(all(close_threads[id(session)] == thread_id for _, thread_id, session in calls))
         self.assertEqual(result["email"], "pool@example.com")
 
     def test_unknown_quota_accounts_are_available_only_when_not_throttled(self) -> None:

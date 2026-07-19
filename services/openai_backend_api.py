@@ -8,6 +8,7 @@ import time
 
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -166,11 +167,12 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self._session_kwargs = proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
-        ))
+        )
+        self.session = requests.Session(**self._session_kwargs)
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -271,16 +273,18 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
+    def _get_me(self, session=None) -> Dict[str, Any]:
+        client = session or self.session
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = client.get(self.base_url + path, headers=self._headers(path), timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_conversation_init(self) -> Dict[str, Any]:
+    def _get_conversation_init(self, session=None) -> Dict[str, Any]:
+        client = session or self.session
         path = "/backend-api/conversation/init"
-        response = self.session.post(
+        response = client.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json"}),
             json={
@@ -295,10 +299,11 @@ class OpenAIBackendAPI:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_default_account(self) -> Dict[str, Any]:
+    def _get_default_account(self, session=None) -> Dict[str, Any]:
+        client = session or self.session
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+        response = client.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+                              timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -314,15 +319,31 @@ class OpenAIBackendAPI:
         })
         return default_account
 
+    def _run_with_isolated_session(self, request_method) -> Dict[str, Any]:
+        session = requests.Session(**self._session_kwargs)
+        session.headers.update(dict(self.session.headers))
+        try:
+            session.cookies.update(self.session.cookies.get_dict())
+        except Exception:
+            pass
+        try:
+            return request_method(session)
+        finally:
+            session.close()
+
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        # curl_cffi keeps one Curl handle per thread. Sharing a Session with a
-        # short-lived nested pool can leave resolver sockets alive after errors.
-        me_payload = self._get_me()
-        init_payload = self._get_conversation_init()
-        default_account = self._get_default_account()
+        # Each worker owns and closes its Curl session. The previous shared
+        # session left per-thread resolver handles alive on partial failures.
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            me_future = executor.submit(self._run_with_isolated_session, self._get_me)
+            init_future = executor.submit(self._run_with_isolated_session, self._get_conversation_init)
+            account_future = executor.submit(self._run_with_isolated_session, self._get_default_account)
+            me_payload = me_future.result()
+            init_payload = init_future.result()
+            default_account = account_future.result()
 
         plan_type = str(default_account.get("plan_type") or "free")
 
